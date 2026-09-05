@@ -1,0 +1,33 @@
+{
+  "repository": "FounderHQ/founderhq-events-android",
+  "version": "0.7.0",
+  "sourceCommit": "dd1f15c51b546ca0360ab8883a61a21bff100e55",
+  "files": {
+    ".github/workflows/release.yml": "f7ef58c1533585964365ccc4b851e605ea76b25eb16f408935319e03716e5580",
+    ".gitignore": "838655f2e91bf2cc39b78e25f41b3706543530eeaca3c710e323d9c7fa5619ca",
+    "LICENSE": "11266b70b5ea51167849f8ff2fc81558da90acb971a670e5ee7787d8151c9ff0",
+    "README.md": "cd2fd54f13cbaa3fcb4786733ce5a129df1b8678679235f43a929c9acc908a8d",
+    "build.gradle.kts": "54d7e7089399aec2a59cf7cb3341db6cfe1ec0549fa9f600b0e145b08715ef9f",
+    "events-compose/build.gradle.kts": "e3e61e102a56fafc87ba72d2f98339f922e416ae2f1d1c1e32e41a710083f2c9",
+    "events-compose/src/main/AndroidManifest.xml": "571f2735faf5e857752ee057ac8ef63425576a721616c60b86ee5d4c0a2d682f",
+    "events-compose/src/main/java/com/founderhq/events/compose/FounderHQNavigationObserver.kt": "fb3fca02dd6877cbd9e2c56e1aaa452d358639f1da496f77ee341545354455e5",
+    "events/build.gradle.kts": "e5264eddf8893794e88ff6535aa7f5bc713dc7eb01c2d8eb1fc077c10b53072e",
+    "events/consumer-rules.pro": "2028d777718b6ba63a52b1d597ff766b338762ce4d84b6602c76b4d7327ded9b",
+    "events/src/main/AndroidManifest.xml": "678647a824ef7ab16066708585790ab265135d32fdf84bcd918a4b050f8891b9",
+    "events/src/main/java/com/founderhq/events/FounderHQEvents.kt": "6374ed1f0a07fbebbe102c8b53f1b254a4fe35b912939ef1fc25c43c3de85fd0",
+    "events/src/main/java/com/founderhq/events/GeneratedProtocolConstants.kt": "463191b0d7de720d1a2c124cf7f9be1af8e4726dabe3c492e984d5e589cd6ee7",
+    "events/src/test/java/com/founderhq/events/FounderHQEventsTest.kt": "2018d2b03aa90d051849c62d302f5ec65c24c5109e7e788829b7a9de68f4c41e",
+    "gradle.properties": "d5f372c6d46ad7c8d33f714bfae564eb5e1d73a159c495df9bc782b33e3567c2",
+    "gradle/wrapper/gradle-wrapper.jar": "7d3a4ac4de1c32b59bc6a4eb8ecb8e612ccd0cf1ae1e99f66902da64df296172",
+    "gradle/wrapper/gradle-wrapper.properties": "7e0821d895908883350587c74476b717016ab416320c44dc82a10def916c6fb5",
+    "gradlew": "b187b4c52e749f5760afdd6fadc31b2a98ad35fb249bf0dff03b72650f320409",
+    "gradlew.bat": "1d297e00bd21de3ace22b4d7f2de1f9dfa858883d66bbf7c1ccbecccec8f4f3b",
+    "sample/build.gradle.kts": "1247375cc4d5460e03ba84274ed23697431472ecd392fa4778c2fe859aa4dbac",
+    "sample/src/main/AndroidManifest.xml": "134edd51c4a1b89a5cb379cf2e187e35083e77d89f4c8ff30c01501710b3037f",
+    "sample/src/main/java/com/founderhq/events/sample/MainActivity.kt": "361253f95484d624ce3729d3180a82a1e28f6d8ce2926e27984cca2e63ffce11",
+    "sample/src/main/java/com/founderhq/events/sample/SampleApplication.kt": "1922808f38af2395d588d8c078b7116cc7c8b5027d9b2736c2fb3fa0c8d99043",
+    "scripts/publish.sh": "6013550cd4082fed4ccbff616c85bcff876a6493f67e863fe53345af217588d3",
+    "settings.gradle.kts": "d5e0e7884a70f983e5022664dff912bab370dea23ac7a4ad525a1343045070ef",
+    "fixtures/conformance-v2.json": "cc606c65516d924e772bbe2c577ce88b1bcf9f03914b57abb98141da4eed67b2"
+  }
+}
