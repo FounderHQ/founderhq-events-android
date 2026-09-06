@@ -9,6 +9,7 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
+import org.robolectric.annotation.Config
 import android.os.Looper
 import java.time.Instant
 import java.io.IOException
@@ -129,6 +130,7 @@ class FounderHQEventsTest {
     }
 
     @Test
+    @Config(sdk = [24])
     fun offlineQueueAppliesSizeAndAgeCaps() {
         val clock = TestClock(1_786_694_000_000)
         val client = FounderHQEvents(
@@ -166,7 +168,21 @@ class FounderHQEventsTest {
         val queue = client.persistedState().getJSONArray("queue")
         assertEquals(1, queue.length())
         assertEquals("fresh", queue.getJSONObject(0).getString("event"))
+        assertEquals(isoTimestamp(clock.nowMillis()), queue.getJSONObject(0).getString("timestamp"))
         client.close()
+    }
+
+    @Test
+    @Config(sdk = [24])
+    fun wireTimestampsSupportAndroid24AndPreviouslyPersistedPrecision() {
+        val epoch = 1_786_694_000_000L
+        assertEquals("2026-08-14T07:53:20.123Z", isoTimestamp(epoch + 123))
+        assertEquals(epoch, parseWireTimestamp("2026-08-14T07:53:20Z"))
+        assertEquals(epoch + 100, parseWireTimestamp("2026-08-14T07:53:20.1Z"))
+        assertEquals(epoch + 123, parseWireTimestamp("2026-08-14T07:53:20.123456789Z"))
+        assertEquals(null, parseWireTimestamp("2026-02-30T07:53:20.123Z"))
+        assertEquals(null, parseWireTimestamp("2026-08-14T07:53:20.123Zextra"))
+        assertEquals(null, parseWireTimestamp("invalid"))
     }
 
     @Test
@@ -487,9 +503,9 @@ class FounderHQEventsTest {
 
         assertEquals("$name left UUID provider values", 0, uuid.remainingIds)
         assertEquals("$name left session UUID values", 0, uuid.remainingSessionIds)
-        transport.urls.forEach { assertEquals("https://app.getfounderhq.com/i/v2/e", it) }
+        transport.urls.forEach { assertEquals("https://i.getfounderhq.com/i/v2/e", it) }
         transport.configUrls.forEach {
-            assertEquals("https://app.getfounderhq.com/i/v1/analytics/config", it)
+            assertEquals("https://i.getfounderhq.com/i/v1/analytics/config", it)
         }
         transport.headers.forEach {
             assertEquals("Bearer $apiKey", it["Authorization"])

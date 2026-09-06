@@ -14,8 +14,9 @@ import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
-import java.time.Instant
-import java.time.format.DateTimeFormatterBuilder
+import java.text.ParsePosition
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
@@ -110,7 +111,7 @@ data class FounderHQEventsDependencies(
 )
 
 data class FounderHQEventsConfig(
-    val host: String = "https://app.getfounderhq.com",
+    val host: String = "https://i.getfounderhq.com",
     val flushAt: Int = 20,
     val flushIntervalSeconds: Long = 5,
     val personProfiles: PersonProfiles = PersonProfiles.IDENTIFIED_ONLY,
@@ -866,7 +867,7 @@ class FounderHQEvents(
 
     companion object {
         const val SDK_NAME = "com.founderhq:events"
-        const val SDK_VERSION = "0.7.0"
+        const val SDK_VERSION = "0.8.0"
         private const val STATE_KEY = "state_v2"
         private val identityKeys = setOf("email", "phone", "externalId", "external_id", "distinct_id")
         // One source of truth: generated from @founderhq/events-core.
@@ -1059,9 +1060,26 @@ private fun wirePurchaseSource(source: FounderHQPurchaseSource): String = when (
     FounderHQPurchaseSource.PLAY_BILLING -> "PLAY_BILLING"
 }
 
-private val wireTimestampFormatter = DateTimeFormatterBuilder().appendInstant(3).toFormatter()
-private fun isoTimestamp(nowMillis: Long): String =
-    wireTimestampFormatter.format(Instant.ofEpochMilli(nowMillis))
+// java.time requires API 26; the SDK supports Android API 24 and 25 too.
+private val wireTimestampFormatter = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
+    timeZone = TimeZone.getTimeZone("UTC")
+    isLenient = false
+}
+private val wireTimestampPattern = Regex("^(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2})(?:\\.(\\d{1,9}))?Z$")
+internal fun isoTimestamp(nowMillis: Long): String = synchronized(wireTimestampFormatter) {
+    wireTimestampFormatter.format(Date(nowMillis))
+}
+
+internal fun parseWireTimestamp(value: String): Long? {
+    val match = wireTimestampPattern.matchEntire(value) ?: return null
+    // Older SDKs emitted whole seconds or variable fractional precision.
+    val normalized = "${match.groupValues[1]}.${match.groupValues[2].take(3).padEnd(3, '0')}Z"
+    return synchronized(wireTimestampFormatter) {
+        val position = ParsePosition(0)
+        wireTimestampFormatter.parse(normalized, position)
+            ?.takeIf { position.index == normalized.length }?.time
+    }
+}
 
 private fun normalizeDistinctId(value: String): String? {
     val distinctId = value.trim()
@@ -1080,9 +1098,7 @@ private fun pruneEventQueue(
     val cutoff = nowMillis - maxOf(0, eventTtlMillis)
     val retained = (0 until queue.length()).mapNotNull { index ->
         val event = queue.optJSONObject(index) ?: return@mapNotNull null
-        val createdAt = runCatching {
-            Instant.parse(event.optString("timestamp")).toEpochMilli()
-        }.getOrNull() ?: return@mapNotNull null
+        val createdAt = parseWireTimestamp(event.optString("timestamp")) ?: return@mapNotNull null
         event.takeIf { createdAt >= cutoff }
     }
     return JSONArray(retained.takeLast(maxOf(1, maxQueueSize)))
@@ -1212,9 +1228,7 @@ private class AndroidPlatformFacts(
 ) : FounderHQPlatformFactsProvider {
     override fun properties(): Map<String, Any?> {
         val metrics = application.resources.displayMetrics
-        val locale = if (android.os.Build.VERSION.SDK_INT >= 24) {
-            LocaleList.getDefault()[0]
-        } else Locale.getDefault()
+        val locale = LocaleList.getDefault()[0]
         val packageInfo = application.packageManager.getPackageInfo(application.packageName, 0)
         @Suppress("DEPRECATION")
         val build = if (android.os.Build.VERSION.SDK_INT >= 28) {
