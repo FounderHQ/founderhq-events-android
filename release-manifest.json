@@ -1,7 +1,7 @@
 {
   "repository": "FounderHQ/founderhq-events-android",
   "version": "1.0.0",
-  "sourceCommit": "f1468fd488689243c37b5acf47a94d541fe4eaf7",
+  "sourceCommit": "293cab985e461819bf6aab56ae68eb1de65af869",
   "files": {
     ".github/workflows/release.yml": "f7ef58c1533585964365ccc4b851e605ea76b25eb16f408935319e03716e5580",
     ".gitignore": "838655f2e91bf2cc39b78e25f41b3706543530eeaca3c710e323d9c7fa5619ca",
