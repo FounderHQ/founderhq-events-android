@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Real resource ids, so getResourceEntryName returns the name the
+         layout author wrote and the test proves the semantic id path. -->
+    <item name="fhq_checkout_button" type="id" />
+    <item name="fhq_secret_field" type="id" />
+    <item name="fhq_plain_view" type="id" />
+    <item name="fhq_root_column" type="id" />
+</resources>

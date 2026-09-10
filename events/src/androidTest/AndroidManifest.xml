@@ -1,0 +1,10 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- MockWebServer serves plain HTTP on the loopback interface. -->
+    <application android:usesCleartextTraffic="true">
+        <activity
+            android:name="com.founderhq.events.ElementCaptureTestActivity"
+            android:exported="false"
+            android:label="Element capture"
+            android:windowSoftInputMode="stateAlwaysHidden" />
+    </application>
+</manifest>

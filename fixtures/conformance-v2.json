@@ -2204,7 +2204,8 @@
                         "attributes": {},
                         "classes": [],
                         "id": "fixture-cta-rearmed",
-                        "tag_name": "button"
+                        "tag_name": "button",
+                        "text": "Rearmed capture"
                       }
                     ],
                     "$host": "example.test",

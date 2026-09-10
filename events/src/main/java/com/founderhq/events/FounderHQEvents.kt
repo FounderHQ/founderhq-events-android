@@ -9,6 +9,9 @@ import android.os.Handler
 import android.os.LocaleList
 import android.os.Looper
 import android.util.Log
+import android.view.MotionEvent
+import android.view.ViewConfiguration
+import android.view.Window
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -20,11 +23,15 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import java.util.Collections
+import java.util.WeakHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 
 enum class PersonProfiles(val wireValue: String) {
     ALWAYS("always"), IDENTIFIED_ONLY("identified_only"), NEVER("never")
@@ -113,7 +120,12 @@ data class FounderHQEventsDependencies(
 data class FounderHQEventsConfig(
     val host: String = "https://i.getfounderhq.com",
     val flushAt: Int = 20,
-    val flushIntervalSeconds: Long = 5,
+    /**
+     * Seconds between background flushes. Ten seconds keeps a phone's radio
+     * asleep for longer than five did, and no product decision depends on an
+     * event arriving five seconds sooner.
+     */
+    val flushIntervalSeconds: Long = 10,
     val personProfiles: PersonProfiles = PersonProfiles.IDENTIFIED_ONLY,
     val optOutByDefault: Boolean = false,
     val captureLifecycle: Boolean = true,
@@ -121,10 +133,62 @@ data class FounderHQEventsConfig(
     val captureSessions: Boolean = true,
     val captureInstallUpdates: Boolean = true,
     val remoteConfig: Boolean = true,
+    /**
+     * Captures `$autocapture` when the user taps a button or another control,
+     * and `$rageclick` when they tap the same control again and again. It is
+     * off by default because it reports on screens the app author never
+     * annotated, which is a decision they should make on purpose.
+     *
+     * Semantic facts are stored: the view class, the resource entry name, the
+     * content description, and the view hierarchy path. A control's own label
+     * is stored with them — a `Button` and its subclasses, and the selected tab
+     * of a Material `TabLayout` — scrubbed of card- and SSN-like tokens and
+     * truncated. A plain `TextView`, an `EditText`'s contents, an `EditText`'s
+     * hint, and touch coordinates are never read into an event.
+     *
+     * This flag is the default, not the ceiling. The remote `autocapture`
+     * setting wins in both directions once it arrives, so an operator can
+     * switch capture on for an app that shipped with this false, and off for
+     * one that shipped with it true. Rage clicks follow `capture_rageclicks`.
+     */
+    val captureElementInteractions: Boolean = false,
+    /**
+     * Emits `$push_notification_opened` when the app reports a notification
+     * tap through [FounderHQEvents.capturePushNotificationOpened]. The SDK
+     * cannot observe taps by itself on Android, so this only gates the
+     * method the app calls.
+     */
+    val capturePushNotificationOpened: Boolean = true,
+    /**
+     * Exact hostnames whose outgoing requests carry the
+     * `x-founderhq-session-id` header through [FounderHQOkHttpInterceptor], so
+     * a backend event can be joined to the visit that caused it. Entries are
+     * hostnames only: no protocol, path, port, or wildcard. Every host you
+     * list can read the session id, so list your own APIs and nothing else.
+     */
+    val tracingHeaders: List<String>? = null,
     val account: FounderHQAccountContext? = null,
     val purchasePrepareTimeoutMillis: Long = 3_000,
-    val maxQueueSize: Int = 100,
+    /**
+     * Events held on disk while delivery fails. A thousand covers a long
+     * offline stretch and still costs well under a megabyte of storage; the
+     * old limit of a hundred threw away a busy session in a few minutes.
+     */
+    val maxQueueSize: Int = 1000,
     val eventTtlMillis: Long = 24 * 60 * 60 * 1_000,
+    /**
+     * Retries an event may spend before the SDK drops it, on top of the first
+     * send. Five walks the whole ladder in [FOUNDERHQ_RETRY_LADDER_MILLIS]:
+     * 30s, 30s, 2min, 5min, and then one last try the next time the app
+     * starts. A lower number truncates the ladder from the front, so 2 means
+     * 30s, 30s and then give up.
+     */
+    val maxRetries: Int = 5,
+    /**
+     * Logs what the SDK dropped and what it refused to configure. Off by
+     * default so a release build stays silent in logcat.
+     */
+    val debug: Boolean = false,
 )
 
 class FounderHQEvents(
@@ -153,13 +217,43 @@ class FounderHQEvents(
     private var captureLifecycleEnabled = config.captureLifecycle
     private var captureScreensEnabled = config.captureScreens
     private var captureSessionsEnabled = config.captureSessions
+    // Touch dispatch reads these on the main thread; remote config writes them
+    // on the SDK's own executor.
+    @Volatile private var captureElementInteractionsEnabled = config.captureElementInteractions
+    @Volatile private var captureRageClicksEnabled = config.captureElementInteractions
     private var callbacksRegistered = false
+    private val tracingHosts = founderHqNormalizeTracingHosts(config.tracingHeaders) { entry ->
+        debugLog("tracingHeaders ignored \"$entry\": list exact hostnames only")
+    }
+    private val ingestHost = founderHqHostOf(config.host)
+    /** Windows whose callback this SDK wrapped, so [close] can hand them back. */
+    /**
+     * The activity on screen, so remote config that switches capture on can
+     * wrap its window now instead of waiting for the next screen. Weak, so a
+     * finished activity is never held alive by this SDK.
+     */
+    private var resumedActivity: java.lang.ref.WeakReference<Activity>? = null
+    private val wrappedWindows: MutableMap<Window, Window.Callback> =
+        Collections.synchronizedMap(WeakHashMap())
+    // Touch dispatch is single threaded, so rage detection needs no lock.
+    private var rageTargetKey: String? = null
+    private val rageTouchTimes = mutableListOf<Long>()
+    private var rageEmittedAt = 0L
+    // The gesture in progress, so a scroll is not mistaken for a tap.
+    private var touchDownX = 0f
+    private var touchDownY = 0f
+    private var touchIsATap = false
 
     init {
+        // A new Activity is not a new process; only the first client built in
+        // this process spends the ladder's last rung.
+        if (FounderHQProcessLaunch.claimFirstInitialization()) {
+            synchronized(lock) { grantNextLaunchRetriesLocked() }
+        }
         applyCachedRemoteConfig()
         if (config.flushIntervalSeconds > 0) {
             executor.scheduleWithFixedDelay(
-                { flush() },
+                { flushOnSchedule() },
                 config.flushIntervalSeconds,
                 config.flushIntervalSeconds,
                 TimeUnit.SECONDS,
@@ -220,7 +314,7 @@ class FounderHQEvents(
             enqueueEventLocked(eventPayload(name, merged))
             state.lastActivityAt = dependencies.clock.nowMillis()
             persist()
-            if (state.queue.length() >= config.flushAt) executor.execute { flush() }
+            if (state.queue.length() >= config.flushAt) executor.execute { flushOnSchedule() }
         }
     }
 
@@ -331,7 +425,13 @@ class FounderHQEvents(
     }
     fun unregister(key: String) = withInitializedState { state.registered.remove(key); persist() }
     fun optIn() = withInitializedState { state.optedOut = false; persist() }
-    fun optOut() = withInitializedState { state.optedOut = true; state.queue = JSONArray(); persist() }
+    fun optOut() = withInitializedState {
+        state.optedOut = true
+        state.queue = JSONArray()
+        state.deliveryAttempts.clear()
+        state.retryEligibleAt.clear()
+        persist()
+    }
     fun isOptedOut(): Boolean = withInitializedState { state.optedOut }
     fun getDistinctId(): String = withInitializedState { state.distinctId }
     fun getSessionId(): String = withInitializedState {
@@ -517,7 +617,12 @@ class FounderHQEvents(
             remote["capture_lifecycle"] as? Boolean ?: config.captureLifecycle
         captureScreensEnabled = remote["capture_screens"] as? Boolean ?: config.captureScreens
         captureSessionsEnabled = remote["capture_sessions"] as? Boolean ?: config.captureSessions
+        val elementsWereEnabled = captureElementInteractionsEnabled
+        applyRemoteElementCaptureLocked(remote)
         updateLifecycleRegistration()
+        if (!elementsWereEnabled && captureElementInteractionsEnabled) {
+            armElementInteractionsOnResumedActivity()
+        }
         val disabled = buildSet {
             if (!captureSessionsEnabled) add("\$session_start")
             if (!captureScreensEnabled) add("\$screen")
@@ -525,6 +630,8 @@ class FounderHQEvents(
                 add("\$application_opened")
                 add("\$application_backgrounded")
             }
+            if (!captureElementInteractionsEnabled) add("\$autocapture")
+            if (!captureRageClicksEnabled) add("\$rageclick")
         }
         if (disabled.isNotEmpty()) {
             state.queue = JSONArray(
@@ -532,8 +639,35 @@ class FounderHQEvents(
                     .map { state.queue.getJSONObject(it) }
                     .filterNot { it.optString("event") in disabled },
             )
+            pruneDeliveryAttemptsLocked()
             persist()
         }
+    }
+
+    /**
+     * Applies the operator's `autocapture` and `capture_rageclicks` settings to
+     * element capture.
+     *
+     * The operator's setting wins, in both directions, exactly as it does for
+     * `capture_screens` and `capture_lifecycle`. An app can ship the wrong
+     * default and cannot be rebuilt on demand, so the dashboard must be able
+     * to switch capture both off and on. [FounderHQEventsConfig.captureElementInteractions]
+     * is the default that holds until the operator's settings arrive.
+     *
+     * Either direction takes effect at once: switching off hands every wrapped
+     * window straight back, and switching on wraps the window on screen.
+     *
+     * The web SDK also accepts an object of URL and CSS-selector rules under
+     * `autocapture`. Those describe a document, not a view hierarchy, so a
+     * non-boolean value means only "not switched off" here.
+     */
+    private fun applyRemoteElementCaptureLocked(remote: Map<String, Any?>) {
+        val wasEnabled = captureElementInteractionsEnabled
+        captureElementInteractionsEnabled =
+            remote["autocapture"] as? Boolean ?: config.captureElementInteractions
+        captureRageClicksEnabled = captureElementInteractionsEnabled &&
+            (remote["capture_rageclicks"] as? Boolean ?: true)
+        if (wasEnabled && !captureElementInteractionsEnabled) releaseWrappedWindows()
     }
 
     fun recordLifecycle(state: String) {
@@ -572,20 +706,66 @@ class FounderHQEvents(
         capture("\$application_installed", properties + mapOf("source" to "play_install_referrer"))
     }
 
-    fun flush(): Boolean {
+    /**
+     * Records that the user opened the app from a notification. Android hands
+     * the tap to the app, not to this SDK, so call this from the activity or
+     * receiver that handles the notification intent. Pass only the campaign
+     * facts you want in analytics; the notification payload may hold message
+     * content, and the SDK sends whatever it is given.
+     */
+    fun capturePushNotificationOpened(properties: Map<String, Any?> = emptyMap()) {
+        if (!config.capturePushNotificationOpened) return
+        capture("\$push_notification_opened", properties)
+    }
+
+    /**
+     * Returns the current session id when [host] is one the app listed in
+     * `tracingHeaders`, and null otherwise. [FounderHQOkHttpInterceptor] calls
+     * this; apps on another HTTP client can call it too. It never blocks on
+     * SDK start-up, because no header is worth delaying the app's request.
+     */
+    fun tracingSessionId(host: String?): String? {
+        if (tracingHosts.isEmpty()) return null
+        val target = host?.trim()?.lowercase(Locale.ROOT)?.takeIf { it.isNotEmpty() } ?: return null
+        if (target !in tracingHosts) return null
+        // Our own ingest already carries the session in the request body.
+        if (target == ingestHost) return null
+        if (initialized.count > 0L) return null
+        return try {
+            if (isOptedOut()) null else getSessionId()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Sends the queue now. An app calling this by hand is asking for a send at
+     * this moment, so a waiting event on the retry ladder is sent anyway; the
+     * ladder still governs every flush the SDK schedules for itself.
+     */
+    fun flush(): Boolean = flushInternal(respectRetryLadder = false)
+
+    /**
+     * The flush the SDK runs on its own: the interval timer, the flushAt
+     * threshold, and going to the background. It skips events whose retry wait
+     * has not elapsed.
+     */
+    internal fun flushOnSchedule(): Boolean = flushInternal(respectRetryLadder = true)
+
+    private fun flushInternal(respectRetryLadder: Boolean): Boolean {
         awaitInitialization()
         // Serialize flushes: overlapping timer, lifecycle, and manual callers
         // run one at a time, so two flushes can never send the same queue
         // head or rotate identity twice. The follower flushes whatever
         // remains, which the server deduplicates by event UUID.
         synchronized(flushGate) {
-            return flushOnce()
+            return flushOnce(respectRetryLadder)
         }
     }
 
     private val flushGate = Any()
 
-    private fun flushOnce(): Boolean {
+    private fun flushOnce(respectRetryLadder: Boolean): Boolean {
         val selected: List<JSONObject>
         synchronized(lock) {
             pruneQueueLocked()
@@ -595,8 +775,15 @@ class FounderHQEvents(
             // unclamped flushAt above that would retry the same oversized
             // batch forever.
             val flushAt = minOf(100, maxOf(1, config.flushAt))
-            selected = (0 until minOf(state.queue.length(), flushAt))
+            // One waiting event never blocks the batch: the eligible events
+            // behind it go now, and the waiting one keeps its place in the
+            // queue for its own rung.
+            val now = dependencies.clock.nowMillis()
+            selected = (0 until state.queue.length())
                 .map { state.queue.getJSONObject(it) }
+                .filter { !respectRetryLadder || isRetryEligibleLocked(it, now) }
+                .take(flushAt)
+            if (selected.isEmpty()) return true
         }
         return try {
             val envelope = JSONObject()
@@ -611,7 +798,10 @@ class FounderHQEvents(
                 ),
                 envelope.toString(),
             )
-            if (response.statusCode !in 200..299) return false
+            if (response.statusCode !in 200..299) {
+                recordDeliveryFailure(selected)
+                return false
+            }
             val ack = JSONObject(response.body)
             val results = ack.getJSONObject("results")
             val completed = mutableSetOf<String>()
@@ -639,11 +829,80 @@ class FounderHQEvents(
                     identify,
                     directive?.optString("distinct_id")?.takeIf { it.isNotBlank() },
                 )
+                pruneDeliveryAttemptsLocked()
                 persist()
             }
+            if (hasRetry) recordDeliveryFailure(selected)
             !hasRetry
         } catch (_: Exception) {
+            recordDeliveryFailure(selected)
             false
+        }
+    }
+
+    /** An event with no recorded wait, or one whose wait has elapsed. */
+    private fun isRetryEligibleLocked(event: JSONObject, nowMillis: Long): Boolean {
+        val uuid = event.optString("uuid").takeIf(String::isNotBlank) ?: return true
+        val eligibleAt = state.retryEligibleAt[uuid] ?: return true
+        return eligibleAt <= nowMillis
+    }
+
+    /**
+     * Spends the final rung of the ladder. Events parked on
+     * [FOUNDERHQ_RETRY_NEXT_LAUNCH] become eligible again, once, because this
+     * is a new process: the device may have moved, rebooted, or changed
+     * network since the last try.
+     */
+    private fun grantNextLaunchRetriesLocked() {
+        val parked = state.retryEligibleAt.filterValues { it == FOUNDERHQ_RETRY_NEXT_LAUNCH }.keys
+        if (parked.isEmpty()) return
+        state.retryEligibleAt.keys.removeAll(parked)
+        persist()
+        debugLog("new process: ${parked.size} event(s) earned their last delivery attempt")
+    }
+
+    /**
+     * Counts one lost delivery attempt against every event that stayed queued,
+     * puts the survivors on the next rung of [FOUNDERHQ_RETRY_LADDER_MILLIS],
+     * and drops the events that ran out of attempts. The events-node client
+     * bounds a batch the same way: one first send plus `maxRetries` retries.
+     */
+    private fun recordDeliveryFailure(selected: List<JSONObject>) {
+        val maxRetries = maxOf(0, config.maxRetries)
+        val now = dependencies.clock.nowMillis()
+        synchronized(lock) {
+            val queued = (0 until state.queue.length()).map { state.queue.getJSONObject(it) }
+            val queuedIds = queued.mapNotNull { it.optString("uuid").takeIf(String::isNotBlank) }
+                .toSet()
+            val exhausted = mutableSetOf<String>()
+            for (event in selected) {
+                val uuid = event.optString("uuid").takeIf(String::isNotBlank) ?: continue
+                if (uuid !in queuedIds) {
+                    state.deliveryAttempts.remove(uuid)
+                    state.retryEligibleAt.remove(uuid)
+                    continue
+                }
+                val attempts = (state.deliveryAttempts[uuid] ?: 0) + 1
+                if (attempts > maxRetries) {
+                    exhausted += uuid
+                    state.deliveryAttempts.remove(uuid)
+                    state.retryEligibleAt.remove(uuid)
+                } else {
+                    state.deliveryAttempts[uuid] = attempts
+                    state.retryEligibleAt[uuid] =
+                        founderHqRetryEligibleAt(attempts, maxRetries, now)
+                }
+            }
+            if (exhausted.isNotEmpty()) {
+                state.queue = JSONArray(
+                    queued.filterNot { it.optString("uuid") in exhausted },
+                )
+                debugLog(
+                    "dropped ${exhausted.size} event(s) after ${maxRetries + 1} delivery attempts",
+                )
+            }
+            pruneDeliveryAttemptsLocked()
+            persist()
         }
     }
 
@@ -655,6 +914,17 @@ class FounderHQEvents(
             application.unregisterActivityLifecycleCallbacks(this)
             callbacksRegistered = false
         }
+        releaseWrappedWindows()
+    }
+
+    /** Hands every window this SDK wrapped back to the app that owns it. */
+    private fun releaseWrappedWindows() {
+        val windows = synchronized(wrappedWindows) { wrappedWindows.keys.toList() }
+        wrappedWindows.clear()
+        // A window callback belongs to the main thread that dispatches into it.
+        if (windows.isNotEmpty()) {
+            Handler(Looper.getMainLooper()).post { windows.forEach(::restoreWindowCallback) }
+        }
     }
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
@@ -665,6 +935,8 @@ class FounderHQEvents(
         if (foregroundActivities == 1) recordLifecycle("active")
     }
     override fun onActivityResumed(activity: Activity) {
+        resumedActivity = java.lang.ref.WeakReference(activity)
+        attachElementInteractions(activity)
         if (captureScreensEnabled) {
             screen(activity.title?.toString()?.takeIf { it.isNotBlank() } ?: activity.javaClass.simpleName)
         }
@@ -673,19 +945,42 @@ class FounderHQEvents(
         foregroundActivities = maxOf(0, foregroundActivities - 1)
         if (foregroundActivities == 0 && captureLifecycleEnabled) {
             recordLifecycle("background")
-            executor.execute { flush() }
+            executor.execute { flushOnSchedule() }
         }
     }
-    override fun onActivityPaused(activity: Activity) = Unit
+    override fun onActivityPaused(activity: Activity) {
+        if (resumedActivity?.get() === activity) resumedActivity = null
+        detachElementInteractions(activity)
+    }
     override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
-    override fun onActivityDestroyed(activity: Activity) = Unit
+    override fun onActivityDestroyed(activity: Activity) {
+        if (resumedActivity?.get() === activity) resumedActivity = null
+        detachElementInteractions(activity)
+    }
+
+    /**
+     * Wraps the window of the activity on screen, for the moment remote config
+     * switches capture on while the user is already looking at a screen.
+     */
+    private fun armElementInteractionsOnResumedActivity() {
+        val activity = resumedActivity?.get() ?: return
+        // A window callback belongs to the main thread that dispatches into it.
+        Handler(Looper.getMainLooper()).post { attachElementInteractions(activity) }
+    }
 
     internal fun persistedState(): JSONObject = synchronized(lock) { state.toJson() }
+
+    /** The element-capture gate as it stands after remote config, for tests. */
+    internal fun elementCaptureEnabled(): Boolean = captureElementInteractionsEnabled
+
+    /** The rage-click gate as it stands after remote config, for tests. */
+    internal fun rageClickCaptureEnabled(): Boolean = captureRageClicksEnabled
 
     fun readyForCapture() { awaitInitialization() }
 
     private fun updateLifecycleRegistration() {
-        val shouldRegister = captureLifecycleEnabled || captureScreensEnabled
+        val shouldRegister = captureLifecycleEnabled || captureScreensEnabled ||
+            captureElementInteractionsEnabled
         if (shouldRegister && !callbacksRegistered) {
             application.registerActivityLifecycleCallbacks(this)
             callbacksRegistered = true
@@ -693,6 +988,115 @@ class FounderHQEvents(
             application.unregisterActivityLifecycleCallbacks(this)
             callbacksRegistered = false
         }
+    }
+
+    /**
+     * Watches touches by wrapping the window callback, which is the only hook
+     * Android offers for taps the app itself handles. The wrapper forwards
+     * every call, so the app sees no change in behaviour.
+     */
+    private fun attachElementInteractions(activity: Activity) {
+        if (!captureElementInteractionsEnabled) return
+        val window = activity.window ?: return
+        val current = window.callback ?: return
+        if (current is FounderHQWindowCallback) return
+        window.callback = FounderHQWindowCallback(current, window, ::observeTouch)
+        wrappedWindows[window] = current
+    }
+
+    private fun detachElementInteractions(activity: Activity) {
+        val window = activity.window ?: return
+        restoreWindowCallback(window)
+        wrappedWindows.remove(window)
+    }
+
+    private fun restoreWindowCallback(window: Window) {
+        // Another library may have wrapped ours since; unwrapping then would
+        // silently disable it, so only the outermost wrapper is removed.
+        val current = window.callback
+        if (current is FounderHQWindowCallback) window.callback = current.delegate
+    }
+
+    /**
+     * Decides whether the gesture that just ended was a tap.
+     *
+     * A user who scrolls a list lifts their finger over whatever row happens
+     * to be under it, and that is not an interaction with the row. So the
+     * whole gesture is watched: a finger that travels further than the
+     * platform's touch slop, a second finger, or a cancelled stream all mean
+     * the gesture was something other than a tap. A stream that starts while
+     * the SDK is attaching has no beginning, and is not a tap either.
+     */
+    private fun observeTouch(window: Window, event: MotionEvent) {
+        // Remote config can switch capture off while a wrapped window is still
+        // dispatching; the wrapper stays, and stops reporting.
+        if (!captureElementInteractionsEnabled) return
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                touchDownX = event.x
+                touchDownY = event.y
+                touchIsATap = true
+                return
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (touchIsATap && movedBeyondSlop(window, event)) touchIsATap = false
+                return
+            }
+            MotionEvent.ACTION_POINTER_DOWN, MotionEvent.ACTION_CANCEL -> {
+                touchIsATap = false
+                return
+            }
+            MotionEvent.ACTION_UP -> Unit
+            else -> return
+        }
+        val wasATap = touchIsATap
+        touchIsATap = false
+        if (!wasATap || movedBeyondSlop(window, event)) return
+        val root = window.peekDecorView() ?: return
+        // Coordinates are used to find the view and are then discarded. They
+        // are never read into an event.
+        val touched = founderHqTouchedView(root, event.x, event.y) ?: return
+        if (founderHqTouchedEnteredValue(touched)) return
+        val target = founderHqInteractiveTarget(touched) ?: return
+        if (founderHqCaptureBlocked(target)) return
+        val properties = mapOf(
+            "\$event_type" to "touch",
+            "\$elements" to founderHqElementMetadata(target),
+            "\$element_path" to founderHqElementPath(target),
+        )
+        // Capture takes the state lock and may flush; the touch dispatch that
+        // called us belongs to the frame the user is looking at.
+        executor.execute { capture("\$autocapture", properties) }
+        if (captureRageClicksEnabled &&
+            rageTouchDetected(founderHqTargetKey(target), dependencies.clock.nowMillis())
+        ) {
+            executor.execute { capture("\$rageclick", properties) }
+        }
+    }
+
+    /** True once the finger has travelled further than a tap ever does. */
+    private fun movedBeyondSlop(window: Window, event: MotionEvent): Boolean {
+        val slop = ViewConfiguration.get(window.context).scaledTouchSlop
+        return abs(event.x - touchDownX) > slop || abs(event.y - touchDownY) > slop
+    }
+
+    /**
+     * Reports the third tap on one target inside a second, and then stays
+     * quiet for a second so one frustrated burst is one event.
+     */
+    private fun rageTouchDetected(key: String, now: Long): Boolean {
+        if (key != rageTargetKey) {
+            rageTargetKey = key
+            rageTouchTimes.clear()
+        }
+        while (rageTouchTimes.isNotEmpty() && now - rageTouchTimes.first() > RAGE_WINDOW_MILLIS) {
+            rageTouchTimes.removeAt(0)
+        }
+        rageTouchTimes.add(now)
+        if (rageTouchTimes.size < RAGE_TOUCH_COUNT) return false
+        if (now - rageEmittedAt <= RAGE_WINDOW_MILLIS) return false
+        rageEmittedAt = now
+        return true
     }
 
     private fun applyCachedRemoteConfig() {
@@ -863,12 +1267,32 @@ class FounderHQEvents(
             config.maxQueueSize,
             config.eventTtlMillis,
         )
+        pruneDeliveryAttemptsLocked()
+    }
+
+    /**
+     * Attempt counters and retry waits only describe queued events; once an
+     * event is delivered or dropped, its ladder position is dead weight.
+     */
+    private fun pruneDeliveryAttemptsLocked() {
+        if (state.deliveryAttempts.isEmpty() && state.retryEligibleAt.isEmpty()) return
+        val queuedIds = (0 until state.queue.length())
+            .mapNotNull { state.queue.optJSONObject(it)?.optString("uuid") }
+            .toSet()
+        state.deliveryAttempts.keys.retainAll(queuedIds)
+        state.retryEligibleAt.keys.retainAll(queuedIds)
+    }
+
+    private fun debugLog(message: String) {
+        if (config.debug) Log.d(SDK_NAME, message)
     }
 
     companion object {
         const val SDK_NAME = "com.founderhq:events"
-        const val SDK_VERSION = "0.8.0"
+        const val SDK_VERSION = "1.0.0"
         private const val STATE_KEY = "state_v2"
+        private const val RAGE_WINDOW_MILLIS = FounderHQProtocolConstants.RAGE_WINDOW_MILLIS
+        private const val RAGE_TOUCH_COUNT = FounderHQProtocolConstants.RAGE_TAP_COUNT
         private val identityKeys = setOf("email", "phone", "externalId", "external_id", "distinct_id")
         // One source of truth: generated from @founderhq/events-core.
         private val allowedReservedEvents =
@@ -912,6 +1336,17 @@ private data class State(
     var optedOut: Boolean,
     var queue: JSONArray,
     var account: AccountState?,
+    /** Lost delivery attempts per queued event UUID. Kept beside the queue so
+     * the wire payload stays exactly what the server expects. */
+    val deliveryAttempts: MutableMap<String, Int>,
+    /**
+     * When each waiting event may be sent again, as a wall clock millisecond.
+     * [FOUNDERHQ_RETRY_NEXT_LAUNCH] means the event waits for a new process
+     * instead. Persisted beside the queue so the retry ladder survives the
+     * process dying, and kept out of the event itself so the wire payload
+     * stays exactly what the server expects.
+     */
+    val retryEligibleAt: MutableMap<String, Long>,
     val restored: Boolean,
     val needsSessionStart: Boolean,
 ) {
@@ -930,6 +1365,8 @@ private data class State(
         .put("optedOut", optedOut)
         .put("queue", queue)
         .put("account", account?.toJson() ?: JSONObject.NULL)
+        .put("deliveryAttempts", JSONObject(deliveryAttempts.toMap()))
+        .put("retryEligibleAt", JSONObject(retryEligibleAt.toMap()))
 
     companion object {
         fun fresh(dependencies: FounderHQEventsDependencies, optedOut: Boolean): State {
@@ -938,7 +1375,7 @@ private data class State(
             return State(
                 id, id, false, id, false, dependencies.uuid.uuidV7(now), now, now,
                 mutableMapOf(), mutableMapOf(), mutableMapOf(), optedOut, JSONArray(), null,
-                false, true,
+                mutableMapOf(), mutableMapOf(), false, true,
             )
         }
 
@@ -967,6 +1404,8 @@ private data class State(
                     json.getBoolean("optedOut"),
                     json.getJSONArray("queue"),
                     json.optJSONObject("account")?.let(AccountState::fromJson),
+                    json.optJSONObject("deliveryAttempts")?.let(::jsonIntMap) ?: mutableMapOf(),
+                    json.optJSONObject("retryEligibleAt")?.let(::jsonLongMap) ?: mutableMapOf(),
                     true,
                     false,
                 )
@@ -976,6 +1415,11 @@ private data class State(
                     maxQueueSize,
                     eventTtlMillis,
                 )
+                val queuedIds = (0 until restored.queue.length())
+                    .mapNotNull { restored.queue.optJSONObject(it)?.optString("uuid") }
+                    .toSet()
+                restored.deliveryAttempts.keys.retainAll(queuedIds)
+                restored.retryEligibleAt.keys.retainAll(queuedIds)
                 dependencies.storage.putString("state_v2", restored.toJson().toString())
                 if (isUuidV7(restored.sessionId)) restored else {
                     val now = dependencies.clock.nowMillis()
@@ -989,6 +1433,18 @@ private data class State(
                 fresh(dependencies, optOutByDefault)
             }
         }
+
+        private fun jsonLongMap(json: JSONObject): MutableMap<String, Long> =
+            json.keys().asSequence()
+                .mapNotNull { key -> json.optLong(key, 0L).takeIf { it > 0L }?.let { key to it } }
+                .toMap()
+                .toMutableMap()
+
+        private fun jsonIntMap(json: JSONObject): MutableMap<String, Int> =
+            json.keys().asSequence()
+                .mapNotNull { key -> json.optInt(key, 0).takeIf { it > 0 }?.let { key to it } }
+                .toMap()
+                .toMutableMap()
 
         private fun jsonObjectMap(json: JSONObject): MutableMap<String, Any?> =
             json.keys().asSequence().associateWith {
@@ -1087,6 +1543,70 @@ private fun normalizeDistinctId(value: String): String? {
         it.length <= 400 &&
             it.lowercase(Locale.ROOT) !in FounderHQProtocolConstants.ILLEGAL_DISTINCT_IDS
     }
+}
+
+/**
+ * The waits between delivery attempts, in order: 30s, 30s, 2min, 5min. After
+ * the last one the event waits for [FOUNDERHQ_RETRY_NEXT_LAUNCH] instead of a
+ * clock.
+ *
+ * The ladder exists because the two reasons a send fails need opposite
+ * answers. A phone in a lift, in a tunnel, or on a train is fine and only
+ * needs a few minutes: the short first rungs catch it, and the app usually
+ * never notices the outage. An event the server will never accept is broken
+ * for good, and retrying it forever wastes the radio, holds a queue slot, and
+ * costs the user battery. So the waits grow, the count is bounded, and the
+ * event dies after the last rung.
+ *
+ * The last rung is the next app launch rather than a longer wait. A failure
+ * that survives five minutes is usually not about the network any more: the
+ * device may have been rebooted, the app killed, or the connection changed.
+ * A fresh process is the moment those conditions have most likely changed, so
+ * the SDK spends the final attempt there. It also rescues a queue from a
+ * process that died before it could retry.
+ *
+ * The 24 hour TTL still wins. An event older than [FounderHQEventsConfig.eventTtlMillis]
+ * is dropped when the queue is pruned, whether or not it has attempts left.
+ */
+internal val FOUNDERHQ_RETRY_LADDER_MILLIS = longArrayOf(30_000L, 30_000L, 120_000L, 300_000L)
+
+/**
+ * Eligibility marker for the final rung: no clock makes this event eligible,
+ * only the SDK starting up in a new process.
+ */
+internal const val FOUNDERHQ_RETRY_NEXT_LAUNCH = Long.MAX_VALUE
+
+/**
+ * The time an event becomes eligible again after [attempts] failed deliveries.
+ *
+ * [attempts] counts the sends already lost, so the first failure earns the
+ * first rung. A [maxRetries] below the ladder length truncates it from the
+ * front and never reaches the next launch rung. A [maxRetries] above it
+ * repeats the last wait, and the next launch rung stays last.
+ */
+internal fun founderHqRetryEligibleAt(
+    attempts: Int,
+    maxRetries: Int,
+    nowMillis: Long,
+): Long {
+    val ladder = FOUNDERHQ_RETRY_LADDER_MILLIS
+    if (maxRetries > ladder.size && attempts >= maxRetries) return FOUNDERHQ_RETRY_NEXT_LAUNCH
+    return nowMillis + ladder[minOf(maxOf(attempts - 1, 0), ladder.size - 1)]
+}
+
+/**
+ * One shot per operating system process. The first [FounderHQEvents] built in
+ * a process claims it, which is how the SDK tells a cold start from a new
+ * Activity: a rotated or restarted Activity reuses the process, and this
+ * static stays claimed.
+ */
+internal object FounderHQProcessLaunch {
+    private val claimed = AtomicBoolean(false)
+
+    fun claimFirstInitialization(): Boolean = claimed.compareAndSet(false, true)
+
+    /** Lets a test stand in for the operating system starting a new process. */
+    internal fun resetForTests() = claimed.set(false)
 }
 
 private fun pruneEventQueue(
