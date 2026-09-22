@@ -5,9 +5,9 @@
 Add `mavenCentral()` to your dependency repositories, then:
 
 ```kotlin
-implementation("com.getfounderhq:events:1.0.0")
+implementation("com.getfounderhq:events:1.0.2")
 // Optional Jetpack Compose integration:
-implementation("com.getfounderhq:events-compose:1.0.0")
+implementation("com.getfounderhq:events-compose:1.0.2")
 ```
 
 Requires Android API 24 or later. Kotlin imports continue to use `com.founderhq`.
@@ -19,7 +19,7 @@ screens, app/device/OS context, deep-link campaigns, install referrer data,
 sessions, identity, consent, and queued events. `com.getfounderhq:events-compose`
 adds a Navigation Compose observer. Neither artifact collects advertising IDs.
 
-Version 1.0.0 sends PostHog-aligned protocol v2 requests to `POST /i/v2/e`, emits
+Version 1.0.2 sends PostHog-aligned protocol v2 requests to `POST /i/v2/e`, emits
 `$session_start`, uses UUIDv7 sessions and screen-scoped `$screen_id` values,
 reports screen/viewport dimensions in physical pixels, and never writes a null
 `person_id` or duplicate identity keys. Automatic facts use the canonical `$`
@@ -127,6 +127,13 @@ Run `./gradlew testDebugUnitTest assembleRelease --max-workers=2` to validate bo
 Release tags publish signed artifacts through the SDK release workflow.
 
 ## Release notes
+
+### 1.0.2
+
+- `$device_type` is now `mobile` or `tablet`, the same spelling as the web,
+  iOS, and React Native SDKs. A large-screen layout reports `tablet`; every
+  device reported `Mobile` before. The server reads the earlier spelling the
+  same way, so older app versions keep working.
 
 ### 1.0.0
 

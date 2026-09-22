@@ -1,6 +1,8 @@
 {
   "capability_exceptions": {
     "android": {
+      "browser-context": "An app has no browser; a web view inside the app reports through the web SDK.",
+      "campaign-context": "Android has no page URL; the Play Install Referrer and app-link parameters stand in, owned by the attribution work.",
       "checkout-metadata": "Android uses mobile purchase attribution tokens instead of browser checkout metadata.",
       "cookieless-consent": "Android consent requires a platform-specific ATT/storage design.",
       "dom-autocapture": "Android captures screens and lifecycle but never inspects native view trees.",
@@ -11,6 +13,8 @@
       "window-ids": "Android has no browser window."
     },
     "ios": {
+      "browser-context": "An app has no browser; a web view inside the app reports through the web SDK.",
+      "campaign-context": "iOS has no page URL; the App Store install referrer and universal-link parameters stand in, owned by the attribution work.",
       "checkout-metadata": "iOS uses mobile purchase attribution tokens instead of browser checkout metadata.",
       "cookieless-consent": "iOS consent requires a platform-specific ATT/storage design.",
       "dom-autocapture": "iOS captures screens and lifecycle but never inspects native view trees.",
@@ -21,6 +25,7 @@
       "window-ids": "iOS has no browser window."
     },
     "react-native": {
+      "browser-context": "An app has no browser; a web view inside the app reports through the web SDK.",
       "checkout-metadata": "React Native uses mobile purchase attribution tokens instead of browser checkout metadata.",
       "cookieless-consent": "React Native consent requires a platform-specific ATT/storage design.",
       "dom-autocapture": "React Native captures screens and lifecycle but never inspects native view trees.",
@@ -50,7 +55,8 @@
       "remote-config",
       "mobile-session-restore",
       "accounts",
-      "mobile-purchase-claims"
+      "mobile-purchase-claims",
+      "device-context"
     ],
     "ios": [
       "capture",
@@ -70,7 +76,8 @@
       "remote-config",
       "mobile-session-restore",
       "accounts",
-      "mobile-purchase-claims"
+      "mobile-purchase-claims",
+      "device-context"
     ],
     "node": [
       "capture",
@@ -97,7 +104,9 @@
       "remote-config",
       "mobile-session-restore",
       "accounts",
-      "mobile-purchase-claims"
+      "mobile-purchase-claims",
+      "device-context",
+      "campaign-context"
     ],
     "web": [
       "capture",
@@ -119,9 +128,298 @@
       "dom-autocapture",
       "scroll",
       "checkout-metadata",
-      "accounts"
+      "accounts",
+      "device-context",
+      "browser-context",
+      "campaign-context"
     ]
   },
+  "context_fixtures": [
+    {
+      "description": "Safari on an iPhone: no Client Hints, the user agent alone names the phone, the OS version, and the browser.",
+      "environment": {
+        "web": {
+          "maxTouchPoints": 5,
+          "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1",
+          "userAgentData": null
+        }
+      },
+      "expect": {
+        "web": {
+          "properties": {
+            "$browser": "Safari",
+            "$browser_version": "18.6",
+            "$device_type": "mobile",
+            "$os": "iOS",
+            "$os_version": "18.6",
+            "$platform": "web"
+          }
+        }
+      },
+      "name": "device-context-iphone-safari",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context",
+        "browser-context"
+      ]
+    },
+    {
+      "description": "A link opened inside Instagram, LinkedIn, or Gmail on an iPhone: WebKit with no browser token is an in-app browser, and it is still a phone.",
+      "environment": {
+        "web": {
+          "maxTouchPoints": 5,
+          "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)",
+          "userAgentData": null
+        }
+      },
+      "expect": {
+        "web": {
+          "properties": {
+            "$browser": "In-app browser",
+            "$device_type": "mobile",
+            "$os": "iOS",
+            "$os_version": "18.7",
+            "$platform": "web"
+          }
+        }
+      },
+      "name": "device-context-iphone-in-app-webview",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context",
+        "browser-context"
+      ]
+    },
+    {
+      "description": "Chrome on an Android phone: Client Hints say mobile outright; the user agent names Android and the Chrome version.",
+      "environment": {
+        "web": {
+          "maxTouchPoints": 5,
+          "userAgent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36",
+          "userAgentData": {
+            "mobile": true,
+            "platformVersion": "14.0.0"
+          }
+        }
+      },
+      "expect": {
+        "web": {
+          "properties": {
+            "$browser": "Chrome",
+            "$browser_version": "128.0",
+            "$device_type": "mobile",
+            "$os": "Android",
+            "$os_version": "14",
+            "$platform": "web"
+          }
+        }
+      },
+      "name": "device-context-android-chrome",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context",
+        "browser-context"
+      ]
+    },
+    {
+      "description": "An Android web view carries a Chrome token and the wv marker; the marker wins and names the in-app browser.",
+      "environment": {
+        "web": {
+          "maxTouchPoints": 5,
+          "userAgent": "Mozilla/5.0 (Linux; Android 14; Pixel 8 Build/AP2A.240805.005; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/128.0.6613.127 Mobile Safari/537.36",
+          "userAgentData": {
+            "mobile": true
+          }
+        }
+      },
+      "expect": {
+        "web": {
+          "properties": {
+            "$browser": "In-app browser",
+            "$device_type": "mobile",
+            "$os": "Android",
+            "$os_version": "14",
+            "$platform": "web"
+          }
+        }
+      },
+      "name": "device-context-android-webview",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context",
+        "browser-context"
+      ]
+    },
+    {
+      "description": "iPadOS Safari presents itself as a Mac; only the touch points give the tablet away.",
+      "environment": {
+        "web": {
+          "maxTouchPoints": 5,
+          "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15",
+          "userAgentData": null
+        }
+      },
+      "expect": {
+        "web": {
+          "properties": {
+            "$browser": "Safari",
+            "$browser_version": "18.6",
+            "$device_type": "tablet",
+            "$platform": "web"
+          }
+        }
+      },
+      "name": "device-context-ipad-presenting-as-mac",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context",
+        "browser-context"
+      ]
+    },
+    {
+      "description": "Edge on Windows 11: the user agent still says Windows NT 10.0, the Client Hints platform version 13+ says 11, and the Edg token beats the Chrome token.",
+      "environment": {
+        "web": {
+          "maxTouchPoints": 0,
+          "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.2739.67",
+          "userAgentData": {
+            "mobile": false,
+            "platformVersion": "15.0.0"
+          }
+        }
+      },
+      "expect": {
+        "web": {
+          "properties": {
+            "$browser": "Edge",
+            "$browser_version": "128.0",
+            "$device_type": "desktop",
+            "$os": "Windows",
+            "$os_version": "11",
+            "$platform": "web"
+          }
+        }
+      },
+      "name": "device-context-windows-edge",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context",
+        "browser-context"
+      ]
+    },
+    {
+      "description": "Firefox on a Mac: no Client Hints at all, a mouse, and a desktop.",
+      "environment": {
+        "web": {
+          "maxTouchPoints": 0,
+          "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:130.0) Gecko/20100101 Firefox/130.0",
+          "userAgentData": null
+        }
+      },
+      "expect": {
+        "web": {
+          "properties": {
+            "$browser": "Firefox",
+            "$browser_version": "130.0",
+            "$device_type": "desktop",
+            "$os": "macOS",
+            "$platform": "web"
+          }
+        }
+      },
+      "name": "device-context-mac-firefox",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context",
+        "browser-context"
+      ]
+    },
+    {
+      "description": "Every campaign parameter on the page URL travels unprefixed on the first event, click ids included.",
+      "environment": {
+        "web": {
+          "maxTouchPoints": 5,
+          "search": "?utm_source=chatgpt.com&utm_medium=ai&utm_campaign=launch&gclid=g-1&fbclid=f-1&ref=ignored",
+          "userAgent": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36",
+          "userAgentData": {
+            "mobile": true
+          }
+        }
+      },
+      "expect": {
+        "web": {
+          "properties": {
+            "fbclid": "f-1",
+            "gclid": "g-1",
+            "utm_campaign": "launch",
+            "utm_medium": "ai",
+            "utm_source": "chatgpt.com"
+          }
+        }
+      },
+      "name": "campaign-context-web-url",
+      "probe_event": "device.probe",
+      "requires": [
+        "campaign-context"
+      ]
+    },
+    {
+      "description": "Expo reports PHONE as the enum value 1; the wire carries the word.",
+      "environment": {
+        "react-native": {
+          "expoDeviceType": 1,
+          "manufacturer": "Apple",
+          "model": "iPhone 16",
+          "platformOS": "ios",
+          "platformVersion": "18.7"
+        }
+      },
+      "expect": {
+        "react-native": {
+          "properties": {
+            "$device_manufacturer": "Apple",
+            "$device_model": "iPhone 16",
+            "$device_type": "mobile",
+            "$os_version": "18.7",
+            "$platform": "ios"
+          }
+        }
+      },
+      "name": "device-context-expo-phone",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context"
+      ]
+    },
+    {
+      "description": "Expo reports TABLET as the enum value 2 on an Android tablet; the platform passes Platform.OS through.",
+      "environment": {
+        "react-native": {
+          "expoDeviceType": 2,
+          "manufacturer": "samsung",
+          "model": "SM-X910",
+          "platformOS": "android",
+          "platformVersion": "15"
+        }
+      },
+      "expect": {
+        "react-native": {
+          "properties": {
+            "$device_manufacturer": "samsung",
+            "$device_model": "SM-X910",
+            "$device_type": "tablet",
+            "$os_version": "15",
+            "$platform": "android"
+          }
+        }
+      },
+      "name": "device-context-expo-android-tablet",
+      "probe_event": "device.probe",
+      "requires": [
+        "device-context"
+      ]
+    }
+  ],
   "fixtures": [
     {
       "actions": [
@@ -6752,5 +7050,21 @@
       ]
     }
   ],
-  "version": 2
+  "version": 2,
+  "vocabulary": {
+    "device_type": [
+      "mobile",
+      "tablet",
+      "desktop",
+      "other"
+    ],
+    "platform": [
+      "web",
+      "ios",
+      "android",
+      "server",
+      "macos",
+      "windows"
+    ]
+  }
 }

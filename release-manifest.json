@@ -1,17 +1,17 @@
 {
   "repository": "FounderHQ/founderhq-events-android",
-  "version": "1.0.0",
-  "sourceCommit": "293cab985e461819bf6aab56ae68eb1de65af869",
+  "version": "1.0.2",
+  "sourceCommit": "7e358aab484980c19be75518a53c3735539d853c",
   "files": {
     ".github/workflows/release.yml": "f7ef58c1533585964365ccc4b851e605ea76b25eb16f408935319e03716e5580",
     ".gitignore": "838655f2e91bf2cc39b78e25f41b3706543530eeaca3c710e323d9c7fa5619ca",
     "LICENSE": "11266b70b5ea51167849f8ff2fc81558da90acb971a670e5ee7787d8151c9ff0",
-    "README.md": "80cfa78a260bea2e94107d8e93a843bcf3c98661732aadfa4a776fb79418c9e3",
+    "README.md": "e0067b172eefc5071bba66aae1c0e2f20b3050ac584a9eec931abf6db604cdc3",
     "build.gradle.kts": "54d7e7089399aec2a59cf7cb3341db6cfe1ec0549fa9f600b0e145b08715ef9f",
-    "events-compose/build.gradle.kts": "335607595a1b7b73915208f4d24ed7dd8b677e74d537cb72731b1acfb13aed59",
+    "events-compose/build.gradle.kts": "84fed17fdcf72d4c225f1dd17af55c461ae545a99e950a07b08e31992ab7844d",
     "events-compose/src/main/AndroidManifest.xml": "571f2735faf5e857752ee057ac8ef63425576a721616c60b86ee5d4c0a2d682f",
     "events-compose/src/main/java/com/founderhq/events/compose/FounderHQNavigationObserver.kt": "fb3fca02dd6877cbd9e2c56e1aaa452d358639f1da496f77ee341545354455e5",
-    "events/build.gradle.kts": "42973d1cf684b0e6cde96724d6e01671fc0537b5151df83c69c7c9ea06dee1fb",
+    "events/build.gradle.kts": "93a93db62b15c05421a601f9faaa4fad0f44229d8e6e94bcd983e7068e40a9f9",
     "events/consumer-rules.pro": "6ce638e25a521571c5760d0f583863a369ab00037089fc8d7d40168fbcda2241",
     "events/src/androidTest/AndroidManifest.xml": "579f0bb73a1ac63f67a4c6fc63e294803c6eed0efc5e5ba6b6ea913051f4e25d",
     "events/src/androidTest/java/com/founderhq/events/ElementCaptureTestActivity.kt": "33fc681b4c93fc7a4f098cb655ce167caf609684b1b8c7b7634a2d5544f3b6a8",
@@ -22,7 +22,7 @@
     "events/src/androidTest/res/values/ids.xml": "9f7b764d272493f574db3a435d380011f60c0ee2f9cdb3e9ab024bf7178b5e6b",
     "events/src/main/AndroidManifest.xml": "678647a824ef7ab16066708585790ab265135d32fdf84bcd918a4b050f8891b9",
     "events/src/main/java/com/founderhq/events/FounderHQElementInteractions.kt": "dee12f8796f6602510490bcdc092f7cd57d0c95708b0d96ded25a2a535bd2a15",
-    "events/src/main/java/com/founderhq/events/FounderHQEvents.kt": "02c77581cee4325a62150606c458575d263445cd3bbeb892f7d049c18d5b0159",
+    "events/src/main/java/com/founderhq/events/FounderHQEvents.kt": "47d41fa054283f7a84c5e4182365d5b23d12c97ab5aa71815d3a72ac0172435d",
     "events/src/main/java/com/founderhq/events/FounderHQOkHttpInterceptor.kt": "d8d4110afbf3891b585c657670c328ed760452b637309b20cf520f00bb520b40",
     "events/src/main/java/com/founderhq/events/GeneratedProtocolConstants.kt": "ecbe4c267b0cd073fd2a037abf86fc7767a7d2000eee3d4843be8b92b2d0113a",
     "events/src/test/java/com/founderhq/events/FounderHQEventsTest.kt": "938a335bd581b180d9c53fac82b903dad51cddc466778fb20bed8ee3d82f9545",
@@ -38,6 +38,6 @@
     "sample/src/main/java/com/founderhq/events/sample/SampleApplication.kt": "1922808f38af2395d588d8c078b7116cc7c8b5027d9b2736c2fb3fa0c8d99043",
     "scripts/publish.sh": "6013550cd4082fed4ccbff616c85bcff876a6493f67e863fe53345af217588d3",
     "settings.gradle.kts": "d5e0e7884a70f983e5022664dff912bab370dea23ac7a4ad525a1343045070ef",
-    "fixtures/conformance-v2.json": "564e39cec13432489bf14786954f8b2f560c09f976659e5ffc56669a7c96e97d"
+    "fixtures/conformance-v2.json": "4dbd18a020f743d43cfd4479f87cd7f4b0a2e9579cf782491840fbfa38cb950a"
   }
 }

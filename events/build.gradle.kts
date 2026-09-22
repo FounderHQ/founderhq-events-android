@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.getfounderhq"
-version = "1.0.0"
+version = "1.0.2"
 
 android {
     namespace = "com.founderhq.events"

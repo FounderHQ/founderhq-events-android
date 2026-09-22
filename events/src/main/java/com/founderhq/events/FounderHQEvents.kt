@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.os.Bundle
 import android.os.Handler
 import android.os.LocaleList
@@ -1289,7 +1290,7 @@ class FounderHQEvents(
 
     companion object {
         const val SDK_NAME = "com.founderhq:events"
-        const val SDK_VERSION = "1.0.0"
+        const val SDK_VERSION = "1.0.1"
         private const val STATE_KEY = "state_v2"
         private const val RAGE_WINDOW_MILLIS = FounderHQProtocolConstants.RAGE_WINDOW_MILLIS
         private const val RAGE_TOUCH_COUNT = FounderHQProtocolConstants.RAGE_TAP_COUNT
@@ -1760,7 +1761,7 @@ private class AndroidPlatformFacts(
             "\$device_manufacturer" to android.os.Build.MANUFACTURER,
             "\$device_name" to android.os.Build.MODEL,
             "\$device_model" to android.os.Build.MODEL,
-            "\$device_type" to "Mobile",
+            "\$device_type" to deviceType(),
             "\$os" to "Android",
             "\$os_version" to android.os.Build.VERSION.RELEASE,
             "\$screen_width" to metrics.widthPixels,
@@ -1772,5 +1773,28 @@ private class AndroidPlatformFacts(
             "\$app_version" to packageInfo.versionName,
             "\$app_build" to build.toString(),
         ).filterValues { it != null && it != "" }
+    }
+
+    // Canonical vocabulary shared with every FounderHQ SDK and the server:
+    // "mobile" | "tablet" | "desktop" | "other" (apps/web/src/lib/event-context.ts).
+    // Android has no tablet flag; a large or extra-large screen layout is the
+    // conventional signal. Versions up to 1.0.0 sent "Mobile" for every
+    // device; the server respells that.
+    //
+    // A television is checked first and on purpose: Android TV reports an
+    // extra-large layout, so without this a TV counts as a tablet — inside
+    // the vocabulary and wrong, which is worse than being outside it.
+    private fun deviceType(): String {
+        val uiMode = application.resources.configuration.uiMode and
+            Configuration.UI_MODE_TYPE_MASK
+        if (uiMode == Configuration.UI_MODE_TYPE_TELEVISION ||
+            uiMode == Configuration.UI_MODE_TYPE_WATCH ||
+            uiMode == Configuration.UI_MODE_TYPE_CAR
+        ) {
+            return "other"
+        }
+        val layout = application.resources.configuration.screenLayout and
+            Configuration.SCREENLAYOUT_SIZE_MASK
+        return if (layout >= Configuration.SCREENLAYOUT_SIZE_LARGE) "tablet" else "mobile"
     }
 }
