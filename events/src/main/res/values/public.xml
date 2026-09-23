@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Keep the property tag private; apps attach properties through the extension. -->
+    <public />
+</resources>

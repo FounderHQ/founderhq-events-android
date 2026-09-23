@@ -11,6 +11,7 @@ import android.os.LocaleList
 import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewConfiguration
 import android.view.Window
 import org.json.JSONArray
@@ -21,6 +22,7 @@ import java.nio.ByteBuffer
 import java.text.ParsePosition
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.GregorianCalendar
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
@@ -190,6 +192,14 @@ data class FounderHQEventsConfig(
      * default so a release build stays silent in logcat.
      */
     val debug: Boolean = false,
+    /** Adds properties to screen views and captured taps, never to custom or lifecycle events. */
+    val autoProperties: ((FounderHQAutoPropertiesContext) -> Map<String, Any?>?)? = null,
+    /**
+     * Runs under the SDK lock on the capturing thread (SDK executor for taps),
+     * except for purchase controls. Null or a throw drops the event. Must be fast,
+     * non-blocking, and must not call the SDK. Identity retries run it again.
+     */
+    val beforeSend: ((JSONObject) -> JSONObject?)? = null,
 )
 
 class FounderHQEvents(
@@ -214,9 +224,11 @@ class FounderHQEvents(
         config.maxQueueSize,
         config.eventTtlMillis,
     )
+    // UI capture gates must not wait for a beforeSend or persistence holding the lock.
+    @Volatile private var optedOutSnapshot = state.optedOut
     private var foregroundActivities = 0
     private var captureLifecycleEnabled = config.captureLifecycle
-    private var captureScreensEnabled = config.captureScreens
+    @Volatile private var captureScreensEnabled = config.captureScreens
     private var captureSessionsEnabled = config.captureSessions
     // Touch dispatch reads these on the main thread; remote config writes them
     // on the SDK's own executor.
@@ -244,6 +256,8 @@ class FounderHQEvents(
     private var touchDownX = 0f
     private var touchDownY = 0f
     private var touchIsATap = false
+    @Volatile private var currentScreenName: String? = null
+    private val autoPropertiesWarned = AtomicBoolean(false)
 
     init {
         // A new Activity is not a new process; only the first client built in
@@ -411,11 +425,36 @@ class FounderHQEvents(
 
     fun screen(name: String, properties: Map<String, Any?> = emptyMap()) {
         awaitInitialization()
-        if (!captureScreensEnabled) return
-        capture(
-            "\$screen",
-            mapOf("\$screen_name" to name, "\$screen_id" to dependencies.uuid.uuid()) + properties,
-        )
+        currentScreenName = name
+        if (!captureScreensEnabled || optedOutSnapshot) return
+        // App code runs on the screen caller's thread, before taking the SDK lock.
+        val extra = autoProperties(FounderHQAutoPropertiesContext("\$screen", name))
+        synchronized(lock) {
+            if (!captureScreensEnabled || state.optedOut) return
+            val automatic = mutableMapOf<String, Any?>(
+                "\$screen_name" to name,
+                "\$screen_id" to dependencies.uuid.uuid(),
+            )
+            founderHqColorScheme(resumedActivity?.get() ?: application)?.let {
+                automatic["\$prefers_color_scheme"] = it
+            }
+            capture("\$screen", automatic + extra + properties)
+        }
+    }
+
+    private fun autoProperties(
+        context: FounderHQAutoPropertiesContext,
+        declarative: List<Pair<String, Any?>> = emptyList(),
+    ): Map<String, Any> {
+        val callback = try {
+            config.autoProperties?.invoke(context)?.toList().orEmpty()
+        } catch (_: Throwable) {
+            if (autoPropertiesWarned.compareAndSet(false, true)) {
+                Log.w(SDK_NAME, "autoProperties threw; capturing the event without its callback properties")
+            }
+            emptyList()
+        }
+        return founderHqSanitizeAutoProperties(declarative + callback)
     }
 
     fun register(properties: Map<String, Any?>) = withInitializedState {
@@ -425,9 +464,14 @@ class FounderHQEvents(
         properties.forEach { (key, value) -> state.registered.putIfAbsent(key, value) }; persist()
     }
     fun unregister(key: String) = withInitializedState { state.registered.remove(key); persist() }
-    fun optIn() = withInitializedState { state.optedOut = false; persist() }
+    fun optIn() = withInitializedState {
+        state.optedOut = false
+        optedOutSnapshot = false
+        persist()
+    }
     fun optOut() = withInitializedState {
         state.optedOut = true
+        optedOutSnapshot = true
         state.queue = JSONArray()
         state.deliveryAttempts.clear()
         state.retryEligibleAt.clear()
@@ -938,8 +982,11 @@ class FounderHQEvents(
     override fun onActivityResumed(activity: Activity) {
         resumedActivity = java.lang.ref.WeakReference(activity)
         attachElementInteractions(activity)
+        val name = activity.title?.toString()?.takeIf { it.isNotBlank() }
+            ?: activity.javaClass.simpleName
+        currentScreenName = name
         if (captureScreensEnabled) {
-            screen(activity.title?.toString()?.takeIf { it.isNotBlank() } ?: activity.javaClass.simpleName)
+            screen(name)
         }
     }
     override fun onActivityStopped(activity: Activity) {
@@ -1057,21 +1104,38 @@ class FounderHQEvents(
         // Coordinates are used to find the view and are then discarded. They
         // are never read into an event.
         val touched = founderHqTouchedView(root, event.x, event.y) ?: return
+        recordElementInteraction(touched)
+    }
+
+    internal fun recordElementInteraction(touched: View) {
+        if (!captureElementInteractionsEnabled || optedOutSnapshot) return
         if (founderHqTouchedEnteredValue(touched)) return
         val target = founderHqInteractiveTarget(touched) ?: return
-        if (founderHqCaptureBlocked(target)) return
+        if (founderHqCaptureBlocked(touched)) return
+        val elements = founderHqElementMetadata(target)
         val properties = mapOf(
             "\$event_type" to "touch",
-            "\$elements" to founderHqElementMetadata(target),
+            "\$elements" to elements,
             "\$element_path" to founderHqElementPath(target),
         )
+        val declarative = founderHqTapPropertyEntries(touched)
+        val screenName = currentScreenName
+        fun captureTap(event: String) {
+            // Read views and the app's callback on the touch thread, before navigation
+            // can replace the hierarchy. Only the property snapshot crosses threads.
+            val extra = autoProperties(
+                FounderHQAutoPropertiesContext(event, screenName, target, elements.first()),
+                declarative,
+            )
+            executor.execute { capture(event, properties + extra) }
+        }
         // Capture takes the state lock and may flush; the touch dispatch that
         // called us belongs to the frame the user is looking at.
-        executor.execute { capture("\$autocapture", properties) }
+        captureTap("\$autocapture")
         if (captureRageClicksEnabled &&
             rageTouchDetected(founderHqTargetKey(target), dependencies.clock.nowMillis())
         ) {
-            executor.execute { capture("\$rageclick", properties) }
+            captureTap("\$rageclick")
         }
     }
 
@@ -1235,8 +1299,9 @@ class FounderHQEvents(
         event.getJSONObject("properties")
             .put("\$anon_distinct_id", anonymousId)
             .put("\$device_id", anonymousId)
+        val finished = finishEvent(event) ?: return
         state.queue = JSONArray(
-            listOf(event) + (0 until state.queue.length()).map { state.queue.getJSONObject(it) },
+            listOf(finished) + (0 until state.queue.length()).map { state.queue.getJSONObject(it) },
         )
         pruneQueueLocked()
     }
@@ -1257,8 +1322,57 @@ class FounderHQEvents(
     private fun persist() { stateWriter.persist(state.toJson().toString()) }
 
     private fun enqueueEventLocked(event: JSONObject) {
-        state.queue.put(event)
+        val finished = finishEvent(event) ?: return
+        state.queue.put(finished)
         pruneQueueLocked()
+    }
+
+    /** Purchase controls and events without a hook keep the SDK-built envelope. */
+    private fun finishEvent(event: JSONObject): JSONObject? {
+        val originalName = event.optString("event")
+        if (originalName == "\$mobile_purchase_prepared" || originalName == "\$mobile_purchase_claim") {
+            return event
+        }
+        val hook = config.beforeSend ?: return event
+        return try {
+            val result = hook.invoke(event) ?: return null
+            if (state.optedOut) return null
+            // Rebuild before snapshotting: unknown keys are ignored, not validated.
+            normalizeTransformedEvent(result, originalName)?.let { JSONObject(it.toString()) }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun normalizeTransformedEvent(event: JSONObject, originalName: String): JSONObject? {
+        val name = (event.opt("event") as? String)?.trim() ?: return null
+        if (name.isEmpty() || (name != originalName && !isAllowedEvent(name))) return null
+        val uuid = event.opt("uuid") as? String ?: return null
+        if (!EVENT_UUID.matches(uuid)) return null
+        val supplied = event.opt("timestamp") as? String ?: return null
+        val instant = parseWireTimestamp(supplied) ?: return null
+        // Ingest takes UTC timestamps only: an offset one is the same instant,
+        // rewritten rather than lost there. A UTC one keeps its own precision.
+        val timestamp = if (supplied.endsWith("Z")) supplied else isoTimestamp(instant)
+        val distinctId = (event.opt("distinct_id") as? String)?.let(::normalizeDistinctId) ?: return null
+        val properties = event.optJSONObject("properties") ?: return null
+        val processProfile = event.optJSONObject("options")?.opt("process_person_profile") as? Boolean
+            ?: return null
+        return JSONObject()
+            .put("uuid", uuid)
+            .put("event", name)
+            .put("distinct_id", distinctId)
+            .put("timestamp", timestamp)
+            .put("properties", properties)
+            .put("options", JSONObject().put("process_person_profile", processProfile))
+            .apply {
+                (event.opt("session_id") as? String)?.takeIf(::isUuidV7)?.let { put("session_id", it) }
+                // Ingest trims a window id and refuses the whole event for an
+                // empty one or one past 200 UTF-16 units; the id goes instead.
+                (event.opt("window_id") as? String)?.trim()
+                    ?.takeIf { it.isNotEmpty() && it.length <= 200 }
+                    ?.let { put("window_id", it) }
+            }
     }
 
     private fun pruneQueueLocked() {
@@ -1290,7 +1404,10 @@ class FounderHQEvents(
 
     companion object {
         const val SDK_NAME = "com.founderhq:events"
-        const val SDK_VERSION = "1.0.1"
+        const val SDK_VERSION = "1.1.0"
+        private val EVENT_UUID = Regex(
+            "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
+        )
         private const val STATE_KEY = "state_v2"
         private const val RAGE_WINDOW_MILLIS = FounderHQProtocolConstants.RAGE_WINDOW_MILLIS
         private const val RAGE_TOUCH_COUNT = FounderHQProtocolConstants.RAGE_TAP_COUNT
@@ -1519,29 +1636,43 @@ private fun wirePurchaseSource(source: FounderHQPurchaseSource): String = when (
 
 // java.time requires API 26; the SDK supports Android API 24 and 25 too.
 private val wireTimestampFormatter = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-    timeZone = TimeZone.getTimeZone("UTC")
+    calendar = GregorianCalendar(TimeZone.getTimeZone("UTC"), Locale.ROOT).apply {
+        gregorianChange = Date(Long.MIN_VALUE)
+    }
     isLenient = false
 }
-private val wireTimestampPattern = Regex("^(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2})(?:\\.(\\d{1,9}))?Z$")
+private val wireTimestampPattern = Regex(
+    "^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.([0-9]+))?(Z|[+-][0-9]{2}:[0-9]{2})$",
+)
 internal fun isoTimestamp(nowMillis: Long): String = synchronized(wireTimestampFormatter) {
     wireTimestampFormatter.format(Date(nowMillis))
 }
 
 internal fun parseWireTimestamp(value: String): Long? {
     val match = wireTimestampPattern.matchEntire(value) ?: return null
-    // Older SDKs emitted whole seconds or variable fractional precision.
+    val zone = match.groupValues[3]
+    val offsetMinutes = if (zone == "Z") 0 else {
+        val hours = zone.substring(1, 3).toInt()
+        val minutes = zone.substring(4, 6).toInt()
+        if (hours > 23 || minutes > 59) return null
+        (hours * 60 + minutes) * if (zone[0] == '-') -1 else 1
+    }
+    // Compare local calendar components before applying the offset. Truncate only
+    // sub-millisecond precision for TTL; the event retains the original timestamp.
     val normalized = "${match.groupValues[1]}.${match.groupValues[2].take(3).padEnd(3, '0')}Z"
     return synchronized(wireTimestampFormatter) {
         val position = ParsePosition(0)
         wireTimestampFormatter.parse(normalized, position)
-            ?.takeIf { position.index == normalized.length }?.time
+            ?.takeIf {
+                position.index == normalized.length && wireTimestampFormatter.format(it) == normalized
+            }?.time?.minus(offsetMinutes * 60_000L)
     }
 }
 
 private fun normalizeDistinctId(value: String): String? {
     val distinctId = value.trim()
     return distinctId.takeIf {
-        it.length <= 400 &&
+        it.isNotEmpty() && it.length <= 400 &&
             it.lowercase(Locale.ROOT) !in FounderHQProtocolConstants.ILLEGAL_DISTINCT_IDS
     }
 }

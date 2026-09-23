@@ -783,6 +783,11 @@ class FounderHQEventsTest {
 
     @Test
     fun executesEveryApplicableFixtureExactlyAgainstSharedGolden() {
+        // Shared fixtures specify no system appearance. Keep that input undefined;
+        // dark/light capture is covered by FounderHQAutoPropertiesTest.
+        val configuration = RuntimeEnvironment.getApplication().resources.configuration
+        configuration.uiMode = configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK.inv()
         val suite = loadSuite()
         val capabilities = suite.getJSONObject("capability_matrix")
             .getJSONArray("android")

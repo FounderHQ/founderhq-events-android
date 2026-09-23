@@ -5,7 +5,7 @@ plugins {
     id("com.vanniktech.maven.publish")
 }
 group = "com.getfounderhq"
-version = "1.0.2"
+version = "1.1.0"
 android {
     namespace = "com.founderhq.events.compose"
     compileSdk = 36

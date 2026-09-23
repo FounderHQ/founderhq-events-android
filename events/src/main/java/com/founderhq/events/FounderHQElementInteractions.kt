@@ -24,7 +24,8 @@ import java.util.Locale
  *
  * The SDK never reads an `EditText`, its contents, or its hint. It never reads
  * a descendant's text in place of the view's own, never reads tooltips or view
- * tags other than the opt-out marker, and never reads touch coordinates.
+ * tags other than the opt-out marker and explicit FHQ properties, and never
+ * records touch coordinates.
  * Coordinates arrive with the touch, resolve the view, and are dropped.
  *
  * Text that does get captured is whitespace-normalised, scrubbed of tokens
@@ -151,11 +152,9 @@ internal fun founderHqTouchedEnteredValue(view: View): Boolean {
 /** True when the view, or anything above it, carries the opt-out tag. */
 internal fun founderHqCaptureBlocked(view: View): Boolean {
     var current: View? = view
-    var depth = 0
-    while (current != null && depth < MAX_TARGET_SEARCH_DEPTH) {
+    while (current != null) {
         if (current.tag as? String == FOUNDERHQ_NO_CAPTURE_TAG) return true
         current = current.parent as? View
-        depth++
     }
     return false
 }

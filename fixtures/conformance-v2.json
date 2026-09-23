@@ -5,7 +5,7 @@
       "campaign-context": "Android has no page URL; the Play Install Referrer and app-link parameters stand in, owned by the attribution work.",
       "checkout-metadata": "Android uses mobile purchase attribution tokens instead of browser checkout metadata.",
       "cookieless-consent": "Android consent requires a platform-specific ATT/storage design.",
-      "dom-autocapture": "Android captures screens and lifecycle but never inspects native view trees.",
+      "dom-autocapture": "Android has no DOM; it records taps on native views instead ($autocapture and $rageclick with the tapped element's description), not browser clicks.",
       "pageleave-resilience": "Android records application lifecycle rather than pageleave.",
       "pageviews": "Android records named screens instead of browser pageviews.",
       "scroll": "Android does not inspect native scroll views.",
@@ -17,7 +17,7 @@
       "campaign-context": "iOS has no page URL; the App Store install referrer and universal-link parameters stand in, owned by the attribution work.",
       "checkout-metadata": "iOS uses mobile purchase attribution tokens instead of browser checkout metadata.",
       "cookieless-consent": "iOS consent requires a platform-specific ATT/storage design.",
-      "dom-autocapture": "iOS captures screens and lifecycle but never inspects native view trees.",
+      "dom-autocapture": "iOS has no DOM; it records taps on native views instead ($autocapture and $rageclick with the tapped element's description), not browser clicks.",
       "pageleave-resilience": "iOS records application lifecycle rather than pageleave.",
       "pageviews": "iOS records named screens instead of browser pageviews.",
       "scroll": "iOS does not inspect native scroll views.",
@@ -28,7 +28,7 @@
       "browser-context": "An app has no browser; a web view inside the app reports through the web SDK.",
       "checkout-metadata": "React Native uses mobile purchase attribution tokens instead of browser checkout metadata.",
       "cookieless-consent": "React Native consent requires a platform-specific ATT/storage design.",
-      "dom-autocapture": "React Native captures screens and lifecycle but never inspects native view trees.",
+      "dom-autocapture": "React Native has no DOM; it records taps on native views instead ($autocapture and $rageclick with the tapped element's description), not browser clicks.",
       "pageleave-resilience": "React Native records application lifecycle rather than pageleave.",
       "pageviews": "React Native records named screens instead of browser pageviews.",
       "scroll": "React Native does not inspect native scroll views.",
@@ -56,7 +56,9 @@
       "mobile-session-restore",
       "accounts",
       "mobile-purchase-claims",
-      "device-context"
+      "device-context",
+      "auto-properties",
+      "before-send"
     ],
     "ios": [
       "capture",
@@ -77,7 +79,9 @@
       "mobile-session-restore",
       "accounts",
       "mobile-purchase-claims",
-      "device-context"
+      "device-context",
+      "auto-properties",
+      "before-send"
     ],
     "node": [
       "capture",
@@ -106,7 +110,9 @@
       "accounts",
       "mobile-purchase-claims",
       "device-context",
-      "campaign-context"
+      "campaign-context",
+      "auto-properties",
+      "before-send"
     ],
     "web": [
       "capture",
@@ -131,7 +137,9 @@
       "accounts",
       "device-context",
       "browser-context",
-      "campaign-context"
+      "campaign-context",
+      "auto-properties",
+      "before-send"
     ]
   },
   "context_fixtures": [
