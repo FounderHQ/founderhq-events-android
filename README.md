@@ -5,9 +5,9 @@
 Add `mavenCentral()` to your dependency repositories, then:
 
 ```kotlin
-implementation("com.getfounderhq:events:1.1.0")
+implementation("com.getfounderhq:events:1.1.1")
 // Optional Jetpack Compose integration:
-implementation("com.getfounderhq:events-compose:1.1.0")
+implementation("com.getfounderhq:events-compose:1.1.1")
 ```
 
 Requires Android API 24 or later. Kotlin imports continue to use `com.founderhq`.
@@ -19,7 +19,7 @@ screens, app/device/OS context, deep-link campaigns, install referrer data,
 sessions, identity, consent, and queued events. `com.getfounderhq:events-compose`
 adds a Navigation Compose observer. Neither artifact collects advertising IDs.
 
-Version 1.1.0 sends PostHog-aligned protocol v2 requests to `POST /i/v2/e`, emits
+Version 1.1.1 sends protocol v2 requests to `POST /i/v2/e`, emits
 `$session_start`, uses UUIDv7 sessions and screen-scoped `$screen_id` values,
 reports screen/viewport dimensions in physical pixels, and never writes a null
 `person_id` or duplicate identity keys. Automatic facts use the canonical `$`
@@ -271,6 +271,11 @@ Run `./gradlew testDebugUnitTest assembleRelease --max-workers=2` to validate bo
 Release tags publish signed artifacts through the SDK release workflow.
 
 ## Release notes
+
+### 1.1.1
+
+- Documentation only; no change in behavior. Both artifacts and the SDK
+  version sent with requests are now `1.1.1`.
 
 ### 1.1.0
 
