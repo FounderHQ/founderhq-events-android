@@ -5,9 +5,9 @@
 Add `mavenCentral()` to your dependency repositories, then:
 
 ```kotlin
-implementation("com.getfounderhq:events:1.1.1")
+implementation("com.getfounderhq:events:1.2.0")
 // Optional Jetpack Compose integration:
-implementation("com.getfounderhq:events-compose:1.1.1")
+implementation("com.getfounderhq:events-compose:1.2.0")
 ```
 
 Requires Android API 24 or later. Kotlin imports continue to use `com.founderhq`.
@@ -19,7 +19,7 @@ screens, app/device/OS context, deep-link campaigns, install referrer data,
 sessions, identity, consent, and queued events. `com.getfounderhq:events-compose`
 adds a Navigation Compose observer. Neither artifact collects advertising IDs.
 
-Version 1.1.1 sends protocol v2 requests to `POST /i/v2/e`, emits
+Version 1.2.0 sends protocol v2 requests to `POST /i/v2/e`, emits
 `$session_start`, uses UUIDv7 sessions and screen-scoped `$screen_id` values,
 reports screen/viewport dimensions in physical pixels, and never writes a null
 `person_id` or duplicate identity keys. Automatic facts use the canonical `$`
@@ -243,7 +243,7 @@ or unavailable. Other events do not automatically receive it.
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
 | `autoProperties` | `((FounderHQAutoPropertiesContext) -> Map<String, Any?>?)?` | `null` | Adds properties to screens and captured taps |
-| `beforeSend` | `((JSONObject) -> JSONObject?)?` | `null` | Changes or drops finished events except purchase controls |
+| `beforeSend` | `((JSONObject) -> JSONObject?)?` | `null` | Changes or drops finished events except purchase and push device controls |
 
 ## Session tracing headers and push notifications
 
@@ -267,10 +267,161 @@ Android delivers notification taps to the app, not to this SDK, so call
 notification intent. It emits `$push_notification_opened` unless
 `capturePushNotificationOpened = false`.
 
+## Push notifications
+
+Available from version 1.2.0.
+
+Register the device so FounderHQ Sequences can send it a push. The SDK has no
+Firebase dependency, never asks for the notification permission, and never
+gets a token itself.
+
+Create the `FounderHQEvents` instance in `Application.onCreate`, not in an
+activity. Firebase can start your app in a new process only to give it a new
+token, and no activity exists then. The SDK supports one process: do not put
+the messaging service, or other code that calls the SDK, in a separate
+`android:process`.
+
+```kotlin
+FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
+    events.registerPushToken(token) // provider defaults to FounderHQPushProvider.FCM
+}
+// Also call it from FirebaseMessagingService.onNewToken.
+
+events.setPushEnabled(false)   // your app's own switch for this device
+events.unregisterPushToken()   // remove the device and forget the token
+```
+
+The SDK always stores the token. A device is registered only for an
+identified person: the SDK sends the registration after `identify` and until
+`reset()`, and sends nothing for a guest. While a person is identified, the
+SDK sends the registration again on every app start, on a new token, and
+after `setPushEnabled`. A `registerPushToken` call that changes nothing sends
+no second registration in the same app start, so you can call it on every
+launch.
+
+With the same provider, a call that gives no `appId` or no `environment`
+keeps the stored value. Thus `onNewToken` can pass only the token.
+
+`reset()` removes the device from the person who signs out. It keeps the
+token on the phone and clears the `setPushEnabled` switch. An `identify` for
+a different person without a `reset()` also clears the switch. If the phone
+is offline, the SDK keeps the removal and sends it first on the next app
+start, with the time of the sign-out. If the same person signs in again
+before the removal goes out, the SDK drops the removal and the device stays.
+While the person is opted out, registrations wait, but a removal is still
+sent. The two device events (`$push_device_registered` and
+`$push_device_removed`) bypass `beforeSend`.
+
+The SDK does not store or send a token that FounderHQ refuses. It logs a
+warning with the reason, and never the token.
+
+The SDK reads `NotificationManager.areNotificationsEnabled()`, which shows no
+prompt, and sends `authorized` or `denied`. Before your app asks on Android
+13 and later, the system reports notifications off, so the SDK sends
+`denied`. Pass `permission` to set the state yourself.
+
+Pass the intent from `onCreate` (only when `savedInstanceState == null`) and
+from `onNewIntent`:
+
+```kotlin
+override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
+    // Not after a rotation: the same intent comes back then.
+    if (savedInstanceState == null) reportPushOpen(intent)
+}
+
+// The activity was already open when the person tapped.
+override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    reportPushOpen(intent)
+}
+
+private fun reportPushOpen(intent: Intent?) {
+    val link = events.capturePushNotificationOpened(intent)
+    if (link != null) openLink(link)
+}
+```
+
+The SDK reads two extras, `fhqOutboundMessageId` and `fhqLink`, and nothing
+else. It sends the first as `$push_message_id` and returns the second. It
+never opens the link. An intent with neither extra is not a FounderHQ
+notification: the SDK sends nothing and returns `null`, so you can pass every
+intent. `FounderHQPushPayload.from(remoteMessage.data)` reads the same two
+keys from a data map.
+
+The call never throws. If Android cannot read the extras (an intent from
+another app can hold a class your app does not know), the SDK sends nothing
+and returns `null`. It does the same when the person starts the app from
+Recents: Android gives the old notification intent again
+(`FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`), but the person did not tap again.
+
+### A push that arrives in the foreground
+
+FounderHQ sends a `notification` part and a `data` part. The result depends
+on the state of your app:
+
+- **Background or closed:** the system tray shows the notification. A tap
+  starts your launcher activity, and the `data` keys are String extras on its
+  intent. FounderHQ sets no `click_action`, so the tap always goes to the
+  launcher activity.
+- **Foreground:** Firebase calls `onMessageReceived` and shows nothing. Your
+  app must build the notification. Put the two FounderHQ keys on its content
+  intent as String extras, then the open is reported the same way.
+
+```kotlin
+class AppMessagingService : FirebaseMessagingService() {
+    private val events get() = (application as MyApplication).events
+
+    // Firebase can call this in a new process, with no activity.
+    override fun onNewToken(token: String) {
+        events.registerPushToken(token)
+    }
+
+    // Firebase calls this only while your app is in the foreground.
+    override fun onMessageReceived(message: RemoteMessage) {
+        val notification = message.notification ?: return
+        val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return
+        launch.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        // The same two String extras that the system tray gives.
+        message.data["fhqOutboundMessageId"]?.let { launch.putExtra("fhqOutboundMessageId", it) }
+        message.data["fhqLink"]?.let { launch.putExtra("fhqLink", it) }
+        val id = message.messageId.hashCode()
+        val tap = PendingIntent.getActivity(
+            this, id, launch,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        // Needs your notification channel and the notification permission.
+        NotificationManagerCompat.from(this).notify(
+            id,
+            NotificationCompat.Builder(this, CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification)
+                .setContentTitle(notification.title)
+                .setContentText(notification.body)
+                .setContentIntent(tap)
+                .setAutoCancel(true)
+                .build(),
+        )
+    }
+}
+```
+
 Run `./gradlew testDebugUnitTest assembleRelease --max-workers=2` to validate both libraries.
 Release tags publish signed artifacts through the SDK release workflow.
 
 ## Release notes
+
+### 1.2.0
+
+- New: push devices for FounderHQ Sequences. `registerPushToken`,
+  `setPushEnabled`, and `unregisterPushToken` register this device for the
+  identified person. `reset()` removes it from the person who signs out.
+- New: `capturePushNotificationOpened(intent)` and
+  `capturePushNotificationOpened(payload)` report the open of a FounderHQ
+  notification and return its link. `FounderHQPushPayload.from` reads the two
+  FounderHQ keys from an intent, a `Bundle`, or `RemoteMessage.data`.
+- After `close()` returns, a client sends and stores nothing more. Before, a
+  flush that was already scheduled could run after `close()`.
+- Both artifacts and the SDK version sent with requests are now `1.2.0`.
 
 ### 1.1.1
 

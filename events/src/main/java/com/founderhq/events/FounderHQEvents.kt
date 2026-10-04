@@ -2,7 +2,9 @@ package com.founderhq.events
 
 import android.app.Activity
 import android.app.Application
+import android.app.NotificationManager
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.Configuration
 import android.os.Bundle
@@ -112,6 +114,71 @@ data class FounderHQAccountContext(
     val contextToken: String? = null,
 )
 
+/** The service that delivers to a push token. */
+enum class FounderHQPushProvider(val wireValue: String) {
+    FCM("fcm"), APNS("apns"), EXPO("expo")
+}
+
+/** The APNs environment of a token. Only for [FounderHQPushProvider.APNS]. */
+enum class FounderHQPushEnvironment(val wireValue: String) {
+    SANDBOX("sandbox"), PRODUCTION("production")
+}
+
+/** The notification permission the app last saw. The SDK never asks for it. */
+enum class FounderHQPushPermission(val wireValue: String) {
+    AUTHORIZED("authorized"), DENIED("denied"), PROVISIONAL("provisional"),
+    NOT_DETERMINED("not_determined")
+}
+
+/**
+ * The two FounderHQ keys of a notification's data. Nothing else in the data
+ * or the intent extras is read.
+ */
+data class FounderHQPushPayload(
+    /** `fhqOutboundMessageId`: the message this notification belongs to. */
+    val messageId: String?,
+    /** `fhqLink`: the URL or deep link to open. The SDK never opens it. */
+    val link: String?,
+) {
+    companion object {
+        /** From `RemoteMessage.getData()`. */
+        @JvmStatic
+        fun from(data: Map<String, *>?): FounderHQPushPayload = FounderHQPushPayload(
+            messageId = text(data?.get(FounderHQProtocolConstants.PUSH_PAYLOAD_MESSAGE_ID_KEY)),
+            link = text(data?.get(FounderHQProtocolConstants.PUSH_PAYLOAD_LINK_KEY)),
+        )
+
+        /**
+         * From the extras of the intent a notification tap starts. Extras
+         * that cannot be read give an empty payload: an intent from another
+         * app can hold a `Parcelable` this app does not know, and Android
+         * throws for the whole bundle then. This never throws.
+         */
+        @JvmStatic
+        fun from(extras: Bundle?): FounderHQPushPayload = try {
+            FounderHQPushPayload(
+                messageId = text(extras?.getString(FounderHQProtocolConstants.PUSH_PAYLOAD_MESSAGE_ID_KEY)),
+                link = text(extras?.getString(FounderHQProtocolConstants.PUSH_PAYLOAD_LINK_KEY)),
+            )
+        } catch (_: Throwable) {
+            EMPTY
+        }
+
+        /** The same, for an intent. This never throws. */
+        @JvmStatic
+        fun from(intent: Intent?): FounderHQPushPayload = try {
+            from(intent?.extras)
+        } catch (_: Throwable) {
+            EMPTY
+        }
+
+        private val EMPTY = FounderHQPushPayload(messageId = null, link = null)
+
+        private fun text(value: Any?): String? =
+            (value as? String)?.trim()?.takeIf(String::isNotEmpty)
+    }
+}
+
 data class FounderHQEventsDependencies(
     val clock: FounderHQClock,
     val uuid: FounderHQUuidProvider,
@@ -196,7 +263,7 @@ data class FounderHQEventsConfig(
     val autoProperties: ((FounderHQAutoPropertiesContext) -> Map<String, Any?>?)? = null,
     /**
      * Runs under the SDK lock on the capturing thread (SDK executor for taps),
-     * except for purchase controls. Null or a throw drops the event. Must be fast,
+     * except for purchase and push device controls. Null or a throw drops the event. Must be fast,
      * non-blocking, and must not call the SDK. Identity retries run it again.
      */
     val beforeSend: ((JSONObject) -> JSONObject?)? = null,
@@ -215,6 +282,8 @@ class FounderHQEvents(
     private val executor: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor()
     private val purchaseExecutor = Executors.newCachedThreadPool()
     private val initialized = CountDownLatch(1)
+    // Written under [flushGate]. A closed client sends and stores nothing more.
+    @Volatile private var closed = false
     @Volatile private var initializationThread: Thread? = null
     private val lock = Any()
     private val stateWriter = SerializedStateWriter(dependencies.storage, STATE_KEY)
@@ -226,6 +295,11 @@ class FounderHQEvents(
     )
     // UI capture gates must not wait for a beforeSend or persistence holding the lock.
     @Volatile private var optedOutSnapshot = state.optedOut
+    // Lets a caller decide, without the lock, whether the notification
+    // permission is worth reading before it takes the lock.
+    @Volatile private var pushTokenStoredSnapshot = state.push?.token != null
+    // The last registration this process queued. Guarded by [lock].
+    private var lastPushRegistration: SentPushRegistration? = null
     private var foregroundActivities = 0
     private var captureLifecycleEnabled = config.captureLifecycle
     @Volatile private var captureScreensEnabled = config.captureScreens
@@ -277,6 +351,11 @@ class FounderHQEvents(
         executor.execute {
             initializationThread = Thread.currentThread()
             try {
+                // Before anything else this start queues: a removal that never
+                // reached the server goes out first.
+                synchronized(lock) { requeuePendingPushRemovalsLocked() }
+                // A binder call, so it is made before the lock is taken.
+                val pushPermission = systemPushPermissionIfNeeded()
                 config.account?.let { setAccountLocked(it, emit = true) }
                 if (revenueCatIdentity != null) {
                     synchronized(lock) {
@@ -295,6 +374,10 @@ class FounderHQEvents(
                         capture("\$session_start")
                     }
                     if (config.captureInstallUpdates) captureInstallOrUpdate()
+                    // Every start registers the stored token again for an
+                    // identified person: it is what keeps "the last used
+                    // device" true on the server.
+                    registerStoredPushDeviceLocked(pushPermission)
                 }
             } finally {
                 initializationThread = null
@@ -344,14 +427,25 @@ class FounderHQEvents(
             Log.w(SDK_NAME, "identify ignored an invalid distinct ID")
             return
         }
+        val pushPermission = systemPushPermissionIfNeeded()
         synchronized(lock) {
-            if (state.optedOut) return
+            if (state.optedOut) {
+                // The identify is not recorded, but the person is signed in
+                // again: a removal that still waits must not take the device.
+                state.push?.let { dropPushRemovalsLocked(it.token, it.provider, id) }
+                return
+            }
+            val previousDistinctId = state.distinctId
+            val wasIdentified = state.identified
             val accountSwitch = state.identified && state.distinctId != id
             if (accountSwitch) {
                 val guestId = dependencies.uuid.uuid()
                 state.anonymousId = guestId
                 state.purchaseAttributionToken = guestId
                 state.account = null
+                // The push switch belonged to the person before, as in reset().
+                state.push?.takeIf { it.enabled != null }
+                    ?.let { setPushLocked(it.copy(enabled = null)) }
             }
             val groupSet = account?.let(::applyAccountLocked)
             val anonymousId = state.anonymousId
@@ -376,6 +470,12 @@ class FounderHQEvents(
                 "\$set" to set,
                 "\$set_once" to setOnce,
             ) + if (groupSet != null) mapOf("\$group_set" to groupSet) else emptyMap())
+            // After `$identify`, so the server already knows who this person
+            // is. A registration for another person moves the device to them.
+            // The same person again changes nothing, so nothing is sent.
+            if (!wasIdentified || previousDistinctId != id) {
+                registerStoredPushDeviceLocked(pushPermission)
+            }
         }
     }
 
@@ -464,15 +564,24 @@ class FounderHQEvents(
         properties.forEach { (key, value) -> state.registered.putIfAbsent(key, value) }; persist()
     }
     fun unregister(key: String) = withInitializedState { state.registered.remove(key); persist() }
-    fun optIn() = withInitializedState {
-        state.optedOut = false
-        optedOutSnapshot = false
-        persist()
+    fun optIn() {
+        val pushPermission = systemPushPermissionIfNeeded()
+        withInitializedState {
+            state.optedOut = false
+            optedOutSnapshot = false
+            persist()
+            // Registrations were held back while the person was opted out.
+            registerStoredPushDeviceLocked(pushPermission)
+        }
     }
     fun optOut() = withInitializedState {
         state.optedOut = true
         optedOutSnapshot = true
-        state.queue = JSONArray()
+        // A device removal still goes out: opting out of analytics must not
+        // leave a signed-out person's device registered.
+        state.queue = JSONArray(queuedPushDeviceRemovalsLocked())
+        // A queued registration went with the queue.
+        lastPushRegistration = null
         state.deliveryAttempts.clear()
         state.retryEligibleAt.clear()
         persist()
@@ -727,8 +836,18 @@ class FounderHQEvents(
     fun reset() = withInitializedState {
         val optedOut = state.optedOut
         val purchaseAttributionEnabled = state.purchaseAttributionEnabled
+        // The removal is built before the identity rotates, so it carries the
+        // distinct ID of the person who signs out. It is the one event a reset
+        // keeps: the rest of the queue goes, as before.
+        removePushDeviceFromCurrentPersonLocked()
+        val removals = queuedPushDeviceRemovalsLocked()
+        // The token stays on the device so the next identify can register it.
+        // The switch does not: it belonged to the person who signs out.
+        val push = state.push?.copy(enabled = null)?.takeUnless(PushDeviceState::isEmpty)
         state = State.fresh(dependencies, optedOut)
         state.purchaseAttributionEnabled = purchaseAttributionEnabled
+        state.queue = JSONArray(removals)
+        state.push = push
         persist()
         if (purchaseAttributionEnabled) {
             revenueCatIdentity?.logIn(state.purchaseAttributionToken)
@@ -736,6 +855,89 @@ class FounderHQEvents(
                 "\$purchase_attribution_token" to state.purchaseAttributionToken,
             ))
         }
+        if (removals.isNotEmpty()) flushPushDeviceRemoval()
+    }
+
+    /**
+     * Stores this device's push token. Pass the token from
+     * `FirebaseMessaging.getInstance().token` and from `onNewToken`. The SDK
+     * has no Firebase dependency, never fetches a token, and never asks for
+     * the notification permission; it only reads whether notifications are
+     * on.
+     *
+     * The device is registered only for an identified person: the SDK sends
+     * the registration after `identify` and until [reset], and sends nothing
+     * for a guest. While a person is identified it sends the registration
+     * again on every app start, on a new token, and after [setPushEnabled].
+     * A call that changes nothing sends nothing when this process already
+     * sent the registration, so the usual call on every launch costs no
+     * second event.
+     *
+     * With the same [provider], a null [appId] or [environment] keeps the
+     * stored value: `onNewToken` can pass only the token.
+     *
+     * A token the server would refuse is not stored and not sent, and the SDK
+     * logs a warning with the reason (never with the token).
+     */
+    @JvmOverloads
+    fun registerPushToken(
+        token: String,
+        provider: FounderHQPushProvider = FounderHQPushProvider.FCM,
+        appId: String? = null,
+        environment: FounderHQPushEnvironment? = null,
+        enabled: Boolean? = null,
+        permission: FounderHQPushPermission? = null,
+    ) {
+        val normalized = when (val result = founderHqNormalizePushToken(token, provider)) {
+            is FounderHQPushTokenResult.Valid -> result.token
+            is FounderHQPushTokenResult.Invalid -> {
+                // The token is never logged, valid or not.
+                Log.w(SDK_NAME, "registerPushToken ignored the token: ${result.reason}")
+                return
+            }
+        }
+        // A binder call, so it is made before the lock is taken.
+        val seen = permission ?: systemPushPermission()
+        withInitializedState {
+            val previous = state.push
+            if (previous?.token != normalized || previous?.provider != provider) {
+                // A refreshed token replaces the old one instead of leaving it behind.
+                removePushDeviceFromCurrentPersonLocked()
+            }
+            val sameProvider = previous?.provider == provider
+            setPushLocked(PushDeviceState(
+                token = normalized,
+                provider = provider,
+                appId = appId?.trim()?.takeIf(String::isNotEmpty)
+                    ?: previous?.appId.takeIf { sameProvider },
+                environment = environment ?: previous?.environment.takeIf { sameProvider },
+                enabled = enabled ?: previous?.enabled,
+                pendingRemovals = state.push?.pendingRemovals.orEmpty(),
+            ))
+            registerStoredPushDeviceLocked(seen, skipWhenAlreadySent = true)
+        }
+    }
+
+    /**
+     * The app's own push switch for this device. `false` stops every push to
+     * it; the token stays registered. The SDK always stores the switch and
+     * sends it only while a person is identified; otherwise it travels with
+     * the next registration. [reset] clears it.
+     */
+    fun setPushEnabled(enabled: Boolean) {
+        val pushPermission = systemPushPermissionIfNeeded()
+        withInitializedState {
+            setPushLocked((state.push ?: PushDeviceState()).copy(enabled = enabled))
+            registerStoredPushDeviceLocked(pushPermission)
+        }
+    }
+
+    /** Removes this device from the current person and forgets the token. */
+    fun unregisterPushToken() = withInitializedState {
+        val removes = removePushDeviceFromCurrentPersonLocked()
+        // Only the removals the server has not accepted yet are kept.
+        setPushLocked(PushDeviceState(pendingRemovals = state.push?.pendingRemovals.orEmpty()))
+        if (removes) flushPushDeviceRemoval()
     }
 
     fun captureDeepLink(url: String) {
@@ -760,7 +962,49 @@ class FounderHQEvents(
      */
     fun capturePushNotificationOpened(properties: Map<String, Any?> = emptyMap()) {
         if (!config.capturePushNotificationOpened) return
-        capture("\$push_notification_opened", properties)
+        capture(FounderHQProtocolConstants.PUSH_NOTIFICATION_OPENED_EVENT, properties)
+    }
+
+    /**
+     * Records the open of a FounderHQ notification and returns its link
+     * (`fhqLink`), or null. Pass the intent that started or reached the
+     * activity. Only `fhqOutboundMessageId` and `fhqLink` are read from its
+     * extras; your app opens the link, the SDK does not.
+     *
+     * An intent with neither key did not come from a FounderHQ notification
+     * (a launcher tap, a deep link, another notification): nothing is sent
+     * and the result is null. So it is safe to call for every intent. Extras
+     * that cannot be read, and a start from Recents
+     * (`FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY`), also send nothing and give
+     * null. This never throws.
+     */
+    @JvmOverloads
+    fun capturePushNotificationOpened(
+        intent: Intent?,
+        properties: Map<String, Any?> = emptyMap(),
+    ): String? {
+        // A start from Recents brings the notification's intent back. The
+        // person did not tap again: no second open, and no link to open.
+        if (intent != null && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY != 0) {
+            return null
+        }
+        return capturePushNotificationOpened(FounderHQPushPayload.from(intent), properties)
+    }
+
+    /** The same, for a payload read with [FounderHQPushPayload.from]. */
+    @JvmOverloads
+    fun capturePushNotificationOpened(
+        payload: FounderHQPushPayload,
+        properties: Map<String, Any?> = emptyMap(),
+    ): String? {
+        if (payload.messageId == null && payload.link == null) return null
+        capturePushNotificationOpened(
+            if (payload.messageId == null) properties
+            else properties + mapOf(
+                FounderHQProtocolConstants.PUSH_PROPERTY_MESSAGE_ID to payload.messageId,
+            ),
+        )
+        return payload.link
     }
 
     /**
@@ -804,6 +1048,9 @@ class FounderHQEvents(
         // head or rotate identity twice. The follower flushes whatever
         // remains, which the server deduplicates by event UUID.
         synchronized(flushGate) {
+            // A flush that was scheduled before close() must not run after it:
+            // by then a newer client can own the stored state.
+            if (closed) return false
             return flushOnce(respectRetryLadder)
         }
     }
@@ -815,7 +1062,7 @@ class FounderHQEvents(
         synchronized(lock) {
             pruneQueueLocked()
             persist()
-            if (state.optedOut || state.queue.length() == 0) return true
+            if (state.queue.length() == 0) return true
             // The ingest endpoint rejects batches over 100 items; an
             // unclamped flushAt above that would retry the same oversized
             // batch forever.
@@ -826,6 +1073,8 @@ class FounderHQEvents(
             val now = dependencies.clock.nowMillis()
             selected = (0 until state.queue.length())
                 .map { state.queue.getJSONObject(it) }
+                // While opted out only a device removal may leave.
+                .filter { !state.optedOut || it.optString("event") == PUSH_DEVICE_REMOVED }
                 .filter { !respectRetryLadder || isRetryEligibleLocked(it, now) }
                 .take(flushAt)
             if (selected.isEmpty()) return true
@@ -844,6 +1093,7 @@ class FounderHQEvents(
                 envelope.toString(),
             )
             if (response.statusCode !in 200..299) {
+                debugLog("delivery refused: HTTP ${response.statusCode}")
                 recordDeliveryFailure(selected)
                 return false
             }
@@ -874,12 +1124,14 @@ class FounderHQEvents(
                     identify,
                     directive?.optString("distinct_id")?.takeIf { it.isNotBlank() },
                 )
+                settlePushRemovalsLocked(completed)
                 pruneDeliveryAttemptsLocked()
                 persist()
             }
             if (hasRetry) recordDeliveryFailure(selected)
             !hasRetry
-        } catch (_: Exception) {
+        } catch (error: Exception) {
+            debugLog("delivery failed: ${error.javaClass.simpleName}: ${error.message}")
             recordDeliveryFailure(selected)
             false
         }
@@ -953,6 +1205,9 @@ class FounderHQEvents(
 
     override fun close() {
         flush()
+        // Waits for a flush that is in flight, and stops the ones still
+        // scheduled: shutdown() lets queued tasks run.
+        synchronized(flushGate) { closed = true }
         executor.shutdown()
         purchaseExecutor.shutdownNow()
         if (callbacksRegistered) {
@@ -1205,14 +1460,24 @@ class FounderHQEvents(
         return synchronized(lock, block)
     }
 
+    /**
+     * The one place an event envelope is built. It never rotates a session:
+     * [capture] does that for a real event. A device removal names its own id
+     * and the person who signed out; every other event is for the person in
+     * place now.
+     */
     private fun eventPayload(
         event: String,
         properties: Map<String, Any?>,
+        uuid: String = dependencies.uuid.uuid(),
+        distinctId: String = state.distinctId,
+        identified: Boolean = state.identified,
+        timestampMillis: Long = dependencies.clock.nowMillis(),
     ): JSONObject = JSONObject()
-        .put("uuid", dependencies.uuid.uuid())
+        .put("uuid", uuid)
         .put("event", event)
-        .put("distinct_id", state.distinctId)
-        .put("timestamp", isoTimestamp(dependencies.clock.nowMillis()))
+        .put("distinct_id", distinctId)
+        .put("timestamp", isoTimestamp(timestampMillis))
         .put(
             "properties",
             JSONObject(properties.filterKeys {
@@ -1224,8 +1489,34 @@ class FounderHQEvents(
             .put(
                 "process_person_profile",
                 config.personProfiles == PersonProfiles.ALWAYS ||
-                    (config.personProfiles == PersonProfiles.IDENTIFIED_ONLY && state.identified),
+                    (config.personProfiles == PersonProfiles.IDENTIFIED_ONLY && identified),
             ))
+
+    /**
+     * A control event: SDK-built properties only, so no super properties, and
+     * `beforeSend` is skipped for it (see [finishEvent]). It does not rotate
+     * the session and does not count as activity. Purchase controls always
+     * carry the attribution token; push device controls never do.
+     */
+    private fun controlEventLocked(
+        event: String,
+        properties: Map<String, Any?>,
+        attributionToken: Boolean,
+        uuid: String = dependencies.uuid.uuid(),
+        distinctId: String = state.distinctId,
+        identified: Boolean = state.identified,
+        timestampMillis: Long = dependencies.clock.nowMillis(),
+    ): JSONObject {
+        val merged = automaticProperties().toMutableMap().apply {
+            if (attributionToken) {
+                put("\$purchase_attribution_token", state.purchaseAttributionToken)
+            } else {
+                remove("\$purchase_attribution_token")
+            }
+            putAll(properties)
+        }
+        return eventPayload(event, merged, uuid, distinctId, identified, timestampMillis)
+    }
 
     private fun captureControlLocked(
         event: String,
@@ -1234,14 +1525,201 @@ class FounderHQEvents(
         persistImmediately: Boolean = true,
     ) {
         if (state.optedOut) return
-        val merged = automaticProperties().toMutableMap().apply {
-            put("\$purchase_attribution_token", state.purchaseAttributionToken)
-            putAll(properties)
-            putAll(accountProperties)
-        }
-        enqueueEventLocked(eventPayload(event, merged))
+        enqueueEventLocked(
+            controlEventLocked(event, properties + accountProperties, attributionToken = true),
+        )
         if (persistImmediately) persist()
     }
+
+    /**
+     * Sends the stored token for the current person, and only for an
+     * identified one: a guest gets no device. Each registration moves "last
+     * seen" on the server, so an unchanged one is sent too: on a start, on
+     * an identify, and on a switch. Only [skipWhenAlreadySent] (the app's own
+     * `registerPushToken`) skips one that is equal to the last one this
+     * process sent. [permission] is read by the caller before it takes the
+     * lock.
+     */
+    private fun registerStoredPushDeviceLocked(
+        permission: FounderHQPushPermission?,
+        skipWhenAlreadySent: Boolean = false,
+    ) {
+        val push = state.push ?: return
+        if (push.token == null || push.provider == null) return
+        if (!state.identified) return
+        // The person has this device again. A removal for the same token,
+        // provider, and person that still waits would take it away on the
+        // next start, so it goes. Before the opt-out check: no registration
+        // is sent then, but the device the server has must stay.
+        dropPushRemovalsLocked(push.token, push.provider, state.distinctId)
+        if (state.optedOut) return
+        val sent = SentPushRegistration(state.distinctId, push.copy(pendingRemovals = emptyList()), permission)
+        if (skipWhenAlreadySent && sent == lastPushRegistration) return
+        lastPushRegistration = sent
+        enqueueEventLocked(controlEventLocked(PUSH_DEVICE_REGISTERED, buildMap {
+            put(FounderHQProtocolConstants.PUSH_PROPERTY_TOKEN, push.token)
+            put(FounderHQProtocolConstants.PUSH_PROPERTY_PROVIDER, push.provider.wireValue)
+            put(FounderHQProtocolConstants.PUSH_PROPERTY_PLATFORM, PUSH_PLATFORM)
+            push.appId?.let { put(FounderHQProtocolConstants.PUSH_PROPERTY_APP_ID, it) }
+            push.environment?.let {
+                put(FounderHQProtocolConstants.PUSH_PROPERTY_ENVIRONMENT, it.wireValue)
+            }
+            push.enabled?.let { put(FounderHQProtocolConstants.PUSH_PROPERTY_ENABLED, it) }
+            permission?.let {
+                put(FounderHQProtocolConstants.PUSH_PROPERTY_PERMISSION, it.wireValue)
+            }
+        }, attributionToken = false))
+        persist()
+    }
+
+    /**
+     * Takes the stored token away from the person in place now. Nothing was
+     * registered for a guest, so there is nothing to remove for one. The
+     * removal is sent even while opted out. Returns whether one was queued.
+     */
+    private fun removePushDeviceFromCurrentPersonLocked(): Boolean {
+        val push = state.push ?: return false
+        val token = push.token ?: return false
+        if (!state.identified) return false
+        // The next registerPushToken for this token is a real change again.
+        lastPushRegistration = null
+        val removal = PendingPushRemoval(
+            uuid = dependencies.uuid.uuid(),
+            token = token,
+            provider = push.provider,
+            distinctId = state.distinctId,
+            removedAt = dependencies.clock.nowMillis(),
+        )
+        // Written down first: the queue can lose an event (age, size,
+        // retries), this list cannot.
+        setPushLocked(push.copy(
+            pendingRemovals = (push.pendingRemovals + removal).takeLast(MAX_PENDING_PUSH_REMOVALS),
+        ))
+        enqueueEventLocked(pushDeviceRemovedEventLocked(removal))
+        persist()
+        return true
+    }
+
+    private fun pushDeviceRemovedEventLocked(removal: PendingPushRemoval): JSONObject =
+        controlEventLocked(
+            PUSH_DEVICE_REMOVED,
+            buildMap {
+                put(FounderHQProtocolConstants.PUSH_PROPERTY_TOKEN, removal.token)
+                removal.provider?.let {
+                    put(FounderHQProtocolConstants.PUSH_PROPERTY_PROVIDER, it.wireValue)
+                }
+            },
+            attributionToken = false,
+            uuid = removal.uuid,
+            distinctId = removal.distinctId,
+            // A removal is only ever written for an identified person.
+            identified = true,
+            // The moment the person signed out, on every send. The server
+            // leaves alone a device that registered again after it.
+            timestampMillis = removal.removedAt,
+        )
+
+    /**
+     * Forgets every removal of this token for this person: the list entry
+     * and the queued copy. Called when the same person has the device again.
+     */
+    private fun dropPushRemovalsLocked(
+        token: String?,
+        provider: FounderHQPushProvider?,
+        distinctId: String,
+    ) {
+        if (token == null || provider == null) return
+        val push = state.push ?: return
+        fun matches(removal: PendingPushRemoval) = removal.token == token &&
+            removal.provider == provider && removal.distinctId == distinctId
+        val queued = (0 until state.queue.length()).map { state.queue.getJSONObject(it) }
+        val kept = queued.filterNot { event ->
+            event.optString("event") == PUSH_DEVICE_REMOVED &&
+                event.optString("distinct_id") == distinctId &&
+                event.optJSONObject("properties")?.let { properties ->
+                    properties.optString(FounderHQProtocolConstants.PUSH_PROPERTY_TOKEN) == token &&
+                        properties.optString(FounderHQProtocolConstants.PUSH_PROPERTY_PROVIDER) ==
+                        provider.wireValue
+                } == true
+        }
+        if (kept.size == queued.size && push.pendingRemovals.none(::matches)) return
+        state.queue = JSONArray(kept)
+        pruneDeliveryAttemptsLocked()
+        setPushLocked(push.copy(pendingRemovals = push.pendingRemovals.filterNot(::matches)))
+    }
+
+    /**
+     * On a start, every removal the server has not accepted goes to the front
+     * of the queue again, before any registration. The queue copy of an older
+     * attempt is replaced, so a removal is never in the queue twice, and it
+     * starts the retry ladder again. It keeps its first timestamp.
+     */
+    private fun requeuePendingPushRemovalsLocked() {
+        val pending = state.push?.pendingRemovals.orEmpty()
+        if (pending.isEmpty()) return
+        val others = (0 until state.queue.length())
+            .map { state.queue.getJSONObject(it) }
+            .filterNot { it.optString("event") == PUSH_DEVICE_REMOVED }
+        state.queue = JSONArray(pending.map(::pushDeviceRemovedEventLocked) + others)
+        for (removal in pending) {
+            state.deliveryAttempts.remove(removal.uuid)
+            state.retryEligibleAt.remove(removal.uuid)
+        }
+        pruneQueueLocked()
+        persist()
+    }
+
+    /** A removal leaves the list when ingest answers anything but "retry". */
+    private fun settlePushRemovalsLocked(completed: Set<String>) {
+        val push = state.push ?: return
+        if (push.pendingRemovals.none { it.uuid in completed }) return
+        setPushLocked(push.copy(
+            pendingRemovals = push.pendingRemovals.filterNot { it.uuid in completed },
+        ))
+    }
+
+    /** Stores the push state. An empty one is not kept. */
+    private fun setPushLocked(push: PushDeviceState) {
+        state.push = push.takeUnless(PushDeviceState::isEmpty)
+        pushTokenStoredSnapshot = push.token != null
+        persist()
+    }
+
+    private fun queuedPushDeviceRemovalsLocked(): List<JSONObject> =
+        (0 until state.queue.length())
+            .map { state.queue.getJSONObject(it) }
+            .filter { it.optString("event") == PUSH_DEVICE_REMOVED }
+
+    /** A logout is often the last thing an app does, so the removal goes now. */
+    private fun flushPushDeviceRemoval() {
+        try {
+            executor.execute { flushOnSchedule() }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // The client is closed; the removal stays queued for the next start.
+        }
+    }
+
+    /**
+     * Whether the system shows this app's notifications, read without a
+     * prompt. Android has no "not asked yet" answer here: before the app asks
+     * on Android 13 and later, notifications are off and this says denied.
+     *
+     * This is a binder call. Never make it while holding [lock]: every
+     * caller reads it first and hands the answer in.
+     */
+    private fun systemPushPermission(): FounderHQPushPermission? = try {
+        (application.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)
+            ?.areNotificationsEnabled()
+            ?.let {
+                if (it) FounderHQPushPermission.AUTHORIZED else FounderHQPushPermission.DENIED
+            }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /** Skips the binder call when there is no token a registration could carry. */
+    private fun systemPushPermissionIfNeeded(): FounderHQPushPermission? =
+        if (pushTokenStoredSnapshot) systemPushPermission() else null
 
     private fun automaticProperties(): Map<String, Any?> =
         dependencies.platformFacts.properties().toMutableMap().apply {
@@ -1327,10 +1805,12 @@ class FounderHQEvents(
         pruneQueueLocked()
     }
 
-    /** Purchase controls and events without a hook keep the SDK-built envelope. */
+    /** Purchase and push device controls, and events without a hook, keep the SDK-built envelope. */
     private fun finishEvent(event: JSONObject): JSONObject? {
         val originalName = event.optString("event")
-        if (originalName == "\$mobile_purchase_prepared" || originalName == "\$mobile_purchase_claim") {
+        if (originalName == "\$mobile_purchase_prepared" || originalName == "\$mobile_purchase_claim" ||
+            originalName == PUSH_DEVICE_REGISTERED || originalName == PUSH_DEVICE_REMOVED
+        ) {
             return event
         }
         val hook = config.beforeSend ?: return event
@@ -1404,11 +1884,17 @@ class FounderHQEvents(
 
     companion object {
         const val SDK_NAME = "com.founderhq:events"
-        const val SDK_VERSION = "1.1.1"
+        const val SDK_VERSION = "1.2.0"
         private val EVENT_UUID = Regex(
             "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
         )
         private const val STATE_KEY = "state_v2"
+        private const val PUSH_DEVICE_REGISTERED =
+            FounderHQProtocolConstants.PUSH_DEVICE_REGISTERED_EVENT
+        private const val PUSH_DEVICE_REMOVED =
+            FounderHQProtocolConstants.PUSH_DEVICE_REMOVED_EVENT
+        /** This SDK's own `$push_platform`. */
+        private const val PUSH_PLATFORM = "android"
         private const val RAGE_WINDOW_MILLIS = FounderHQProtocolConstants.RAGE_WINDOW_MILLIS
         private const val RAGE_TOUCH_COUNT = FounderHQProtocolConstants.RAGE_TAP_COUNT
         private val identityKeys = setOf("email", "phone", "externalId", "external_id", "distinct_id")
@@ -1467,6 +1953,8 @@ private data class State(
     val retryEligibleAt: MutableMap<String, Long>,
     val restored: Boolean,
     val needsSessionStart: Boolean,
+    /** Absent until the app registers a push token or sets its push switch. */
+    var push: PushDeviceState? = null,
 ) {
     fun toJson(): JSONObject = JSONObject()
         .put("anonymousId", anonymousId)
@@ -1485,6 +1973,7 @@ private data class State(
         .put("account", account?.toJson() ?: JSONObject.NULL)
         .put("deliveryAttempts", JSONObject(deliveryAttempts.toMap()))
         .put("retryEligibleAt", JSONObject(retryEligibleAt.toMap()))
+        .apply { push?.let { put("push", it.toJson()) } }
 
     companion object {
         fun fresh(dependencies: FounderHQEventsDependencies, optedOut: Boolean): State {
@@ -1526,6 +2015,8 @@ private data class State(
                     json.optJSONObject("retryEligibleAt")?.let(::jsonLongMap) ?: mutableMapOf(),
                     true,
                     false,
+                    json.optJSONObject("push")
+                        ?.let { PushDeviceState.fromJson(it, dependencies.clock.nowMillis()) },
                 )
                 restored.queue = pruneEventQueue(
                     restored.queue,
@@ -1568,6 +2059,184 @@ private data class State(
             json.keys().asSequence().associateWith {
                 json.opt(it).takeUnless { value -> value == JSONObject.NULL }
             }.toMutableMap()
+    }
+}
+
+/** What the SDK keeps about this device's push registration. */
+private data class PushDeviceState(
+    val token: String? = null,
+    val provider: FounderHQPushProvider? = null,
+    val appId: String? = null,
+    val environment: FounderHQPushEnvironment? = null,
+    /** The app's own switch. Null until the app sets it; `reset()` clears it. */
+    val enabled: Boolean? = null,
+    /**
+     * Removals the server has not accepted yet. One leaves the list only when
+     * ingest accepts it, so a logout while offline is not lost with the queue.
+     */
+    val pendingRemovals: List<PendingPushRemoval> = emptyList(),
+) {
+    fun isEmpty() = token == null && enabled == null && pendingRemovals.isEmpty()
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        token?.let { put("token", it) }
+        provider?.let { put("provider", it.wireValue) }
+        appId?.let { put("appId", it) }
+        environment?.let { put("environment", it.wireValue) }
+        enabled?.let { put("enabled", it) }
+        if (pendingRemovals.isNotEmpty()) {
+            put("pendingRemovals", JSONArray(pendingRemovals.map(PendingPushRemoval::toJson)))
+        }
+    }
+
+    companion object {
+        /**
+         * A field an older build wrote and this one does not know is left
+         * behind, and a missing one is simply absent.
+         */
+        fun fromJson(json: JSONObject, nowMillis: Long): PushDeviceState? {
+            val provider = json.optString("provider").let { value ->
+                FounderHQPushProvider.values().firstOrNull { it.wireValue == value }
+            }
+            val token = json.optString("token").takeIf { it.isNotBlank() && provider != null }
+            val removals = json.optJSONArray("pendingRemovals")
+            return PushDeviceState(
+                token = token,
+                provider = provider.takeIf { token != null },
+                appId = json.optString("appId").takeIf { it.isNotBlank() && token != null },
+                environment = json.optString("environment").let { value ->
+                    FounderHQPushEnvironment.values().firstOrNull { it.wireValue == value }
+                }.takeIf { token != null },
+                enabled = if (json.has("enabled")) json.optBoolean("enabled") else null,
+                pendingRemovals = (0 until (removals?.length() ?: 0))
+                    .mapNotNull { index ->
+                        removals?.optJSONObject(index)
+                            ?.let { PendingPushRemoval.fromJson(it, nowMillis) }
+                    }
+                    .takeLast(MAX_PENDING_PUSH_REMOVALS),
+            ).takeUnless(PushDeviceState::isEmpty)
+        }
+    }
+}
+
+/** A person keeps at most this many removals waiting for the server. */
+private const val MAX_PENDING_PUSH_REMOVALS = 10
+
+private data class PendingPushRemoval(
+    /** The event id. It stays the same on every send, so ingest counts it once. */
+    val uuid: String,
+    val token: String,
+    val provider: FounderHQPushProvider?,
+    /** The person the device is removed from. */
+    val distinctId: String,
+    /** When the person signed out. The event carries this time on every send. */
+    val removedAt: Long,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("uuid", uuid)
+        put("token", token)
+        provider?.let { put("provider", it.wireValue) }
+        put("distinctId", distinctId)
+        put("removedAt", removedAt)
+    }
+
+    companion object {
+        /** [nowMillis] stands in for the time an earlier build did not write. */
+        fun fromJson(json: JSONObject, nowMillis: Long): PendingPushRemoval? {
+            val uuid = json.optString("uuid").takeIf(String::isNotBlank) ?: return null
+            val token = json.optString("token").takeIf(String::isNotBlank) ?: return null
+            val distinctId = json.optString("distinctId").takeIf(String::isNotBlank) ?: return null
+            return PendingPushRemoval(
+                uuid = uuid,
+                token = token,
+                provider = json.optString("provider").let { value ->
+                    FounderHQPushProvider.values().firstOrNull { it.wireValue == value }
+                },
+                distinctId = distinctId,
+                removedAt = json.optLong("removedAt", 0L).takeIf { it > 0L } ?: nowMillis,
+            )
+        }
+    }
+}
+
+/** What a registration event said, to tell an equal one from a changed one. */
+private data class SentPushRegistration(
+    val distinctId: String,
+    val push: PushDeviceState,
+    val permission: FounderHQPushPermission?,
+)
+
+/** What [founderHqNormalizePushToken] answers. */
+internal sealed class FounderHQPushTokenResult {
+    /** The token as the server stores it. */
+    data class Valid(val token: String) : FounderHQPushTokenResult()
+    /** Why the server would refuse it. Never holds the token. */
+    data class Invalid(val reason: String) : FounderHQPushTokenResult()
+}
+
+private const val PUSH_TOKEN_MIN_LENGTH = 8
+private const val PUSH_TOKEN_MAX_LENGTH = 4096
+private val APNS_PUSH_TOKEN = Regex("^[0-9a-fA-F]{64,200}$")
+private val EXPO_PUSH_TOKEN = Regex("^Expo(?:nent)?PushToken\\[[^\\[\\]\\s]+\\]$")
+
+/**
+ * Whitespace as the server's JavaScript reads it (`trim()` and `\s`): the
+ * ECMAScript WhiteSpace and LineTerminator characters. Kotlin's own
+ * `isWhitespace` is not the same set: it leaves out U+FEFF and adds U+001C
+ * to U+001F, so it would store a token the server refuses and refuse one the
+ * server stores.
+ */
+private fun isServerWhitespace(char: Char): Boolean = when (char) {
+    '\u0009', '\u000A', '\u000B', '\u000C', '\u000D', '\u0020', '\u00A0', '\u1680',
+    '\u2028', '\u2029', '\u202F', '\u205F', '\u3000', '\uFEFF' -> true
+    else -> char in '\u2000'..'\u200A'
+}
+
+/**
+ * The token as the server stores it, or the reason the server would refuse
+ * it. The rules are the server's and must stay the same as
+ * `normalizePushToken` in apps/web/src/lib/comms/push-devices.ts:
+ *
+ * - every provider: 8 to 4096 characters after a trim, no whitespace inside
+ *   ("whitespace" is the server's: see [isServerWhitespace]);
+ * - `apns`: 64 to 200 hex characters, stored lowercase;
+ * - `expo`: `ExponentPushToken[...]` or `ExpoPushToken[...]`, with no
+ *   bracket and no whitespace inside the brackets;
+ * - `fcm`: nothing more.
+ *
+ * The iOS and React Native SDKs apply the same rules, and the three test
+ * suites share one table of cases.
+ */
+internal fun founderHqNormalizePushToken(
+    token: String,
+    provider: FounderHQPushProvider,
+): FounderHQPushTokenResult {
+    val name = provider.wireValue
+    val trimmed = token.trim(::isServerWhitespace)
+    if (trimmed.length !in PUSH_TOKEN_MIN_LENGTH..PUSH_TOKEN_MAX_LENGTH) {
+        return FounderHQPushTokenResult.Invalid(
+            "a $name token has $PUSH_TOKEN_MIN_LENGTH to $PUSH_TOKEN_MAX_LENGTH characters",
+        )
+    }
+    if (trimmed.any(::isServerWhitespace)) {
+        return FounderHQPushTokenResult.Invalid("a $name token has no whitespace")
+    }
+    return when (provider) {
+        FounderHQPushProvider.APNS ->
+            if (APNS_PUSH_TOKEN.matches(trimmed)) {
+                FounderHQPushTokenResult.Valid(trimmed.lowercase(Locale.ROOT))
+            } else {
+                FounderHQPushTokenResult.Invalid("an apns token is 64 to 200 hex characters")
+            }
+        FounderHQPushProvider.EXPO ->
+            if (EXPO_PUSH_TOKEN.matches(trimmed)) {
+                FounderHQPushTokenResult.Valid(trimmed)
+            } else {
+                FounderHQPushTokenResult.Invalid(
+                    "an expo token looks like ExponentPushToken[...] or ExpoPushToken[...]",
+                )
+            }
+        FounderHQPushProvider.FCM -> FounderHQPushTokenResult.Valid(trimmed)
     }
 }
 
@@ -1748,12 +2417,27 @@ private fun pruneEventQueue(
     eventTtlMillis: Long,
 ): JSONArray {
     val cutoff = nowMillis - maxOf(0, eventTtlMillis)
+    // A device removal waits for the server however long that takes: it has
+    // no age limit, and it is the last event a full queue gives up. The
+    // pending list bounds how many there are.
+    fun isRemoval(event: JSONObject) =
+        event.optString("event") == FounderHQProtocolConstants.PUSH_DEVICE_REMOVED_EVENT
     val retained = (0 until queue.length()).mapNotNull { index ->
         val event = queue.optJSONObject(index) ?: return@mapNotNull null
         val createdAt = parseWireTimestamp(event.optString("timestamp")) ?: return@mapNotNull null
-        event.takeIf { createdAt >= cutoff }
+        event.takeIf { createdAt >= cutoff || isRemoval(it) }
     }
-    return JSONArray(retained.takeLast(maxOf(1, maxQueueSize)))
+    var overflow = retained.size - maxOf(1, maxQueueSize)
+    if (overflow <= 0) return JSONArray(retained)
+    // The oldest events go first, but a removal stays.
+    return JSONArray(retained.filter { event ->
+        if (overflow > 0 && !isRemoval(event)) {
+            overflow--
+            false
+        } else {
+            true
+        }
+    })
 }
 
 private class SerializedStateWriter(
