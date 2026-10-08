@@ -1,7 +1,7 @@
 {
   "repository": "FounderHQ/founderhq-events-android",
   "version": "1.3.0",
-  "sourceCommit": "b23122db7ce31d90e5753dd1a1bcdf0e215b87d3",
+  "sourceCommit": "080c40a1a436e5e5fbeaea078f099a23a822e634",
   "files": {
     ".github/workflows/release.yml": "f7ef58c1533585964365ccc4b851e605ea76b25eb16f408935319e03716e5580",
     ".gitignore": "838655f2e91bf2cc39b78e25f41b3706543530eeaca3c710e323d9c7fa5619ca",
@@ -30,7 +30,7 @@
     "events/src/main/res/values/public.xml": "0a8313efa9f1758346684342d65303be66f5b2ddb576178c9ed1c6ff48c96de9",
     "events/src/test/java/com/founderhq/events/FounderHQAutoPropertiesTest.kt": "ae2a42473a1410954b96be2f1ee48bb3f28b93a386d46b982c0a298fe4e28aa8",
     "events/src/test/java/com/founderhq/events/FounderHQEventsTest.kt": "904f5dfe154f2797e8bc1f3d388eb6fb6479fc9e64b5ed7b2b9f706378fbe6d2",
-    "events/src/test/java/com/founderhq/events/FounderHQPushDeviceTest.kt": "1fd7bafec42804f1d185e125e7828f9f2b9b523ffc35fa67ac9b26b9c2d72472",
+    "events/src/test/java/com/founderhq/events/FounderHQPushDeviceTest.kt": "a2c478f7f22e9170f838b30cb9a11aa7d80344039e5d17593ab3c7ee47561a16",
     "events/src/test/java/com/google/android/material/tabs/TabLayout.kt": "f88109a54ce8a53378bb3b251ac3e9f98ca25c04ba06bf762fb46ffd8caf3873",
     "gradle.properties": "d5f372c6d46ad7c8d33f714bfae564eb5e1d73a159c495df9bc782b33e3567c2",
     "gradle/wrapper/gradle-wrapper.jar": "7d3a4ac4de1c32b59bc6a4eb8ecb8e612ccd0cf1ae1e99f66902da64df296172",
