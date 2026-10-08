@@ -901,6 +901,63 @@ class FounderHQPushDeviceTest {
             second.persistedState().getJSONObject("push").toString(),
         )
     }
+
+    @Test
+    fun aNotificationIsNamedByItsKeyOrElseByItsMessageId() {
+        assertEquals(
+            "order-42",
+            FounderHQPushPayload.from(
+                mapOf("fhqOutboundMessageId" to "msg_1", "fhqNotificationKey" to " order-42 "),
+            ).notificationKey,
+        )
+        assertEquals(
+            "msg_1",
+            FounderHQPushPayload.from(mapOf("fhqOutboundMessageId" to "msg_1")).notificationKey,
+        )
+        val extras = Bundle().apply {
+            putString("fhqOutboundMessageId", "msg_2")
+            putString("fhqNotificationKey", "order-43")
+        }
+        assertEquals("order-43", FounderHQPushPayload.from(extras).notificationKey)
+        assertNull(FounderHQPushPayload.from(mapOf("fhqLink" to "acme://home")).notificationKey)
+    }
+
+    @Test
+    fun dismissesTheNotificationsWithThatKeyAndNoOther() {
+        val client = PushHarness().client()
+        val manager = RuntimeEnvironment.getApplication()
+            .getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        @Suppress("DEPRECATION")
+        fun show(tag: String?, id: Int) = manager.notify(tag, id, android.app.Notification())
+        show("order-42", 0)
+        show("order-42", 7)
+        show("order-43", 0)
+        show(null, 1)
+
+        assertEquals(2, client.dismissPushNotification(" order-42 "))
+        assertEquals(listOf("order-43", null), manager.activeNotifications.map { it.tag })
+        assertEquals(0, client.dismissPushNotification("order-42"))
+        assertEquals(0, client.dismissPushNotification("  "))
+        client.close()
+    }
+
+    @Test
+    fun aSilentRemovalFromTheServerCancelsTheNotificationAndEveryOtherMessageIsLeftToTheApp() {
+        val client = PushHarness().client()
+        val manager = RuntimeEnvironment.getApplication()
+            .getSystemService(android.content.Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+        @Suppress("DEPRECATION")
+        manager.notify("order-42", 0, android.app.Notification())
+
+        assertFalse(client.handlePushMessage(null))
+        assertFalse(client.handlePushMessage(mapOf("fhqOutboundMessageId" to "msg_1")))
+        assertFalse(client.handlePushMessage(mapOf("fhqRemoveNotificationKey" to " ")))
+        assertEquals(1, manager.activeNotifications.size)
+
+        assertTrue(client.handlePushMessage(mapOf("fhqRemoveNotificationKey" to "order-42")))
+        assertEquals(0, manager.activeNotifications.size)
+        client.close()
+    }
 }
 
 private const val FCM_TOKEN = "fcm-registration-token:APA91b-example"

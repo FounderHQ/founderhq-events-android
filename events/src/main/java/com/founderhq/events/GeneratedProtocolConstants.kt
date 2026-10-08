@@ -136,4 +136,10 @@ internal object FounderHQProtocolConstants {
 
     /** The key of a push payload that holds the image URL. */
     const val PUSH_PAYLOAD_IMAGE_URL_KEY = "fhqImageUrl"
+
+    /** The key of a push payload that holds the notification key. */
+    const val PUSH_PAYLOAD_NOTIFICATION_KEY = "fhqNotificationKey"
+
+    /** The key of a silent push that names the notification to remove. */
+    const val PUSH_PAYLOAD_REMOVE_NOTIFICATION_KEY = "fhqRemoveNotificationKey"
 }
