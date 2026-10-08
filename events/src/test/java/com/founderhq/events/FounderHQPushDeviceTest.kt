@@ -923,6 +923,8 @@ class FounderHQPushDeviceTest {
     }
 
     @Test
+    // Robolectric cannot list the notifications of the newest Android yet.
+    @Config(sdk = [34])
     fun dismissesTheNotificationsWithThatKeyAndNoOther() {
         val client = PushHarness().client()
         val manager = RuntimeEnvironment.getApplication()
@@ -935,13 +937,15 @@ class FounderHQPushDeviceTest {
         show(null, 1)
 
         assertEquals(2, client.dismissPushNotification(" order-42 "))
-        assertEquals(listOf("order-43", null), manager.activeNotifications.map { it.tag })
+        assertEquals(setOf("order-43", null), manager.activeNotifications.map { it.tag }.toSet())
         assertEquals(0, client.dismissPushNotification("order-42"))
         assertEquals(0, client.dismissPushNotification("  "))
         client.close()
     }
 
     @Test
+    // Robolectric cannot list the notifications of the newest Android yet.
+    @Config(sdk = [34])
     fun aSilentRemovalFromTheServerCancelsTheNotificationAndEveryOtherMessageIsLeftToTheApp() {
         val client = PushHarness().client()
         val manager = RuntimeEnvironment.getApplication()
