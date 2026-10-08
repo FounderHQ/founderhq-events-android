@@ -139,14 +139,28 @@ data class FounderHQPushPayload(
     val messageId: String?,
     /** `fhqLink`: the URL or deep link to open. The SDK never opens it. */
     val link: String?,
+    /**
+     * The name of the notification: `fhqNotificationKey` when the sender set
+     * one, or else the message id. Android shows a FounderHQ push with this
+     * as its tag. An app that shows the notification itself (a push that
+     * arrives while it is open) posts it with the same tag, so a later push
+     * replaces it and [FounderHQEvents.dismissPushNotification] finds it.
+     */
+    val notificationKey: String? = null,
 ) {
     companion object {
         /** From `RemoteMessage.getData()`. */
         @JvmStatic
-        fun from(data: Map<String, *>?): FounderHQPushPayload = FounderHQPushPayload(
-            messageId = text(data?.get(FounderHQProtocolConstants.PUSH_PAYLOAD_MESSAGE_ID_KEY)),
-            link = text(data?.get(FounderHQProtocolConstants.PUSH_PAYLOAD_LINK_KEY)),
-        )
+        fun from(data: Map<String, *>?): FounderHQPushPayload {
+            val messageId = text(data?.get(FounderHQProtocolConstants.PUSH_PAYLOAD_MESSAGE_ID_KEY))
+            return FounderHQPushPayload(
+                messageId = messageId,
+                link = text(data?.get(FounderHQProtocolConstants.PUSH_PAYLOAD_LINK_KEY)),
+                notificationKey =
+                    text(data?.get(FounderHQProtocolConstants.PUSH_PAYLOAD_NOTIFICATION_KEY))
+                        ?: messageId,
+            )
+        }
 
         /**
          * From the extras of the intent a notification tap starts. Extras
@@ -156,9 +170,14 @@ data class FounderHQPushPayload(
          */
         @JvmStatic
         fun from(extras: Bundle?): FounderHQPushPayload = try {
+            val messageId =
+                text(extras?.getString(FounderHQProtocolConstants.PUSH_PAYLOAD_MESSAGE_ID_KEY))
             FounderHQPushPayload(
-                messageId = text(extras?.getString(FounderHQProtocolConstants.PUSH_PAYLOAD_MESSAGE_ID_KEY)),
+                messageId = messageId,
                 link = text(extras?.getString(FounderHQProtocolConstants.PUSH_PAYLOAD_LINK_KEY)),
+                notificationKey =
+                    text(extras?.getString(FounderHQProtocolConstants.PUSH_PAYLOAD_NOTIFICATION_KEY))
+                        ?: messageId,
             )
         } catch (_: Throwable) {
             EMPTY
@@ -1005,6 +1024,60 @@ class FounderHQEvents(
             ),
         )
         return payload.link
+    }
+
+    /**
+     * Takes a FounderHQ notification off the device: call it when the person
+     * has seen what the notification is about (they opened the order, the
+     * chat, the screen). [key] is the notification key the push was sent
+     * with, or the id of the message when it had none.
+     *
+     * Android shows a FounderHQ push with that key as the notification's
+     * tag, so this cancels this app's notifications with that tag, and no
+     * other. It sends nothing and stores nothing. Returns how many it
+     * cancelled. This never throws.
+     */
+    fun dismissPushNotification(key: String): Int {
+        val wanted = key.trim()
+        if (wanted.isEmpty()) return 0
+        return try {
+            val manager =
+                application.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                    ?: return 0
+            var cancelled = 0
+            for (shown in manager.activeNotifications) {
+                if (shown.tag == wanted) {
+                    manager.cancel(shown.tag, shown.id)
+                    cancelled += 1
+                }
+            }
+            cancelled
+        } catch (_: Throwable) {
+            0
+        }
+    }
+
+    /**
+     * Removes a notification when FounderHQ asks from the server. Call it
+     * first in `FirebaseMessagingService.onMessageReceived` with
+     * `message.data`:
+     *
+     *     override fun onMessageReceived(message: RemoteMessage) {
+     *         if (founderHQ.handlePushMessage(message.data)) return
+     *         // Your own handling.
+     *     }
+     *
+     * Returns true when the message was a FounderHQ removal: it shows
+     * nothing, and the SDK has cancelled the notification it names. Returns
+     * false for every other message. This never throws.
+     */
+    fun handlePushMessage(data: Map<String, *>?): Boolean {
+        val key = (data?.get(FounderHQProtocolConstants.PUSH_PAYLOAD_REMOVE_NOTIFICATION_KEY) as? String)
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
+            ?: return false
+        dismissPushNotification(key)
+        return true
     }
 
     /**
@@ -1884,7 +1957,7 @@ class FounderHQEvents(
 
     companion object {
         const val SDK_NAME = "com.founderhq:events"
-        const val SDK_VERSION = "1.2.0"
+        const val SDK_VERSION = "1.3.0"
         private val EVENT_UUID = Regex(
             "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89aAbB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$",
         )

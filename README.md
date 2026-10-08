@@ -5,9 +5,9 @@
 Add `mavenCentral()` to your dependency repositories, then:
 
 ```kotlin
-implementation("com.getfounderhq:events:1.2.0")
+implementation("com.getfounderhq:events:1.3.0")
 // Optional Jetpack Compose integration:
-implementation("com.getfounderhq:events-compose:1.2.0")
+implementation("com.getfounderhq:events-compose:1.3.0")
 ```
 
 Requires Android API 24 or later. Kotlin imports continue to use `com.founderhq`.
@@ -377,22 +377,28 @@ class AppMessagingService : FirebaseMessagingService() {
         events.registerPushToken(token)
     }
 
-    // Firebase calls this only while your app is in the foreground.
+    // Firebase calls this for a push that arrives while your app is in the
+    // foreground, and for a removal FounderHQ sends from the server.
     override fun onMessageReceived(message: RemoteMessage) {
+        // A removal shows nothing: the SDK cancels the notification it names.
+        if (events.handlePushMessage(message.data)) return
         val notification = message.notification ?: return
         val launch = packageManager.getLaunchIntentForPackage(packageName) ?: return
         launch.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
         // The same two String extras that the system tray gives.
         message.data["fhqOutboundMessageId"]?.let { launch.putExtra("fhqOutboundMessageId", it) }
         message.data["fhqLink"]?.let { launch.putExtra("fhqLink", it) }
-        val id = message.messageId.hashCode()
+        // The tag the system tray gives a FounderHQ push: a later push with
+        // the same key replaces this one, and dismissPushNotification finds it.
+        val key = FounderHQPushPayload.from(message.data).notificationKey
         val tap = PendingIntent.getActivity(
-            this, id, launch,
+            this, key.hashCode(), launch,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         // Needs your notification channel and the notification permission.
         NotificationManagerCompat.from(this).notify(
-            id,
+            key,
+            0,
             NotificationCompat.Builder(this, CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_notification)
                 .setContentTitle(notification.title)
@@ -408,7 +414,37 @@ class AppMessagingService : FirebaseMessagingService() {
 Run `./gradlew testDebugUnitTest assembleRelease --max-workers=2` to validate both libraries.
 Release tags publish signed artifacts through the SDK release workflow.
 
+### Replace or remove a notification
+
+A FounderHQ push has a notification key: the key the sender set, or else the
+message id. Android shows the push with that key as the notification's tag,
+so a later push with the same key replaces it. `FounderHQPushPayload.from`
+gives the key as `notificationKey`; a notification your app builds itself
+(see above) uses it as its tag.
+
+Remove a notification when the person has seen what it is about:
+
+```kotlin
+events.dismissPushNotification("order-1042") // returns how many it cancelled
+```
+
+FounderHQ can also ask from the server (`POST /api/v1/push/remove`). It sends
+a data message that shows nothing. Call `handlePushMessage` first in
+`onMessageReceived`: it returns `true` for a removal and cancels the
+notification it names, and `false` for every other message.
+
 ## Release notes
+
+### 1.3.0
+
+- New: `dismissPushNotification(key)` cancels this app's notifications with
+  that notification key (or message ID). Call it when the person has seen
+  what the notification is about.
+- New: `handlePushMessage(data)` removes a notification when FounderHQ asks
+  from your server with a data message.
+- `FounderHQPushPayload` has `notificationKey`: the tag Android gives a
+  FounderHQ notification. Use it for a notification your app builds itself.
+- Both artifacts and the SDK version sent with requests are now `1.3.0`.
 
 ### 1.2.0
 
